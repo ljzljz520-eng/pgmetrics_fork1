@@ -997,6 +997,8 @@ type WAL struct {
 	WriteTime   float64 `json:"write_time"` // in milliseconds, 0 in pg >= 18
 	SyncTime    float64 `json:"sync_time"`  // in milliseconds, 0 in pg >= 18
 	StatsReset  int64   `json:"stats_reset"`
+	// following fields present only in schema 1.21 and later
+	FPIBytes int64 `json:"fpi_bytes,omitempty"` // only in pg >= 19
 }
 
 // Azure represents metrics and information collected from Azure PostgreSQL
