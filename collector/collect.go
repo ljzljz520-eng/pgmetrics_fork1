@@ -2056,7 +2056,9 @@ func (c *collector) getStatements(currdb string) {
 
 	// Collect based on pss version, not pg version. This allows for cases when
 	// postgres is upgraded, but not the extension.
-	if semver.Compare(version, "v1.12") >= 0 { // pg v18
+	if semver.Compare(version, "v1.13") >= 0 { // pg v19
+		c.getStatementsv113(schema)
+	} else if semver.Compare(version, "v1.12") >= 0 { // pg v18
 		c.getStatementsv112(schema)
 	} else if semver.Compare(version, "v1.11") >= 0 { // pg v17
 		c.getStatementsv111(schema)
@@ -2071,7 +2073,15 @@ func (c *collector) getStatements(currdb string) {
 	}
 }
 
+func (c *collector) getStatementsv113(schema string) {
+	c.getStatementsv112orv113(schema, true)
+}
+
 func (c *collector) getStatementsv112(schema string) {
+	c.getStatementsv112orv113(schema, false)
+}
+
+func (c *collector) getStatementsv112orv113(schema string, isv113 bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2089,11 +2099,17 @@ func (c *collector) getStatementsv112(schema string) {
 			jit_emission_count, jit_emission_time, local_blk_read_time,
 			local_blk_write_time, jit_deform_count, jit_deform_time,
 			stats_since, minmax_stats_since, wal_buffers_full,
-			parallel_workers_to_launch, parallel_workers_launched
+			parallel_workers_to_launch, parallel_workers_launched,
+			generic_plan_calls, custom_plan_calls
 		  FROM @schema@.pg_stat_statements
 		  ORDER BY total_exec_time DESC
 		  LIMIT $2`
 	q = strings.ReplaceAll(q, "@schema@", schema)
+	if !isv113 {
+		// these are only in pss schema v1.13
+		q = strings.Replace(q, "generic_plan_calls", "0", 1)
+		q = strings.Replace(q, "custom_plan_calls", "0", 1)
+	}
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength, c.stmtsLimit)
 	if err != nil {
 		log.Printf("warning: pg_stat_statements query failed: %v", err)
@@ -2120,6 +2136,7 @@ func (c *collector) getStatementsv112(schema string) {
 			&s.JITEmissionTime, &s.LocalBlkReadTime, &s.LocalBlkWriteTime,
 			&s.JITDeformCount, &s.JITDeformTime, &statsSince, &minMaxStatsSince,
 			&s.WALBuffersFull, &s.ParallelWorkersToLaunch, &s.ParallelWorkersLaunched,
+			&s.GenericPlanCalls, &s.CustomPlanCalls,
 		); err != nil {
 			log.Fatalf("pg_stat_statements scan failed: %v", err)
 		}

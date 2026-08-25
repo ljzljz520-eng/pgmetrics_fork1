@@ -19,6 +19,7 @@ package pgmetrics
 // ModelSchemaVersion is the schema version of the "Model" data structure
 // defined below. It is in the "semver" notation. Version history:
 //
+//	1.21 - Postgres 19 support
 //	1.20 - Add subscription conflict stats, IO stats, pgbouncer 1.25 support
 //	1.19 - Postgres 18 support
 //	1.18 - Add schema name for extensions
@@ -41,7 +42,7 @@ package pgmetrics
 //	1.2 - more table and index attributes
 //	1.1 - added NotificationQueueUsage and Statements
 //	1.0 - initial release
-const ModelSchemaVersion = "1.20"
+const ModelSchemaVersion = "1.21"
 
 // Model contains the entire information collected by a single run of
 // pgmetrics. It can be converted to and from json without loss of
@@ -700,6 +701,9 @@ type Statement struct {
 	WALBuffersFull          int64 `json:"wal_buffers_full,omitempty"`           // pg >= v18
 	ParallelWorkersToLaunch int64 `json:"parallel_workers_to_launch,omitempty"` // pg >= v18
 	ParallelWorkersLaunched int64 `json:"parallel_workers_launched,omitempty"`  // pg >= v18
+	// following fields present only in schema 1.21 and later
+	GenericPlanCalls int64 `json:"generic_plan_calls,omitempty"` // pg >= v19
+	CustomPlanCalls  int64 `json:"custom_plan_calls,omitempty"`  // pg >= v19
 }
 
 // Publication represents a single v10+ publication. Added in schema 1.2.
