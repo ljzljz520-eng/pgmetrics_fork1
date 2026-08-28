@@ -39,6 +39,11 @@ const (
 	pgv12 = 12_00_00
 	pgv13 = 13_00_00
 	pgv14 = 14_00_00
+	pgv15 = 15_00_00
+	pgv16 = 16_00_00
+	pgv17 = 17_00_00
+	pgv18 = 18_00_00
+	pgv19 = 19_00_00
 )
 
 func writeHumanTo(fd io.Writer, o options, result *pgmetrics.Model) {
@@ -832,6 +837,15 @@ func fmtConns(d *pgmetrics.Database) string {
 }
 
 func reportDatabases(fd io.Writer, result *pgmetrics.Model) {
+	pg19OrLater := getVersion(result) >= pgv19
+	fmtSeqCount := func(n int) string {
+		if !pg19OrLater {
+			return ""
+		}
+		return fmt.Sprintf(`
+        Sequences:         %d`, n)
+	}
+
 	for i, d := range result.Databases {
 		fmt.Fprintf(fd, `
 Database #%d:
@@ -991,7 +1005,7 @@ Database #%d:
         Name:              %s
         Enabled?           %s
         Publications:      %d
-        Tables:            %d
+        Tables:            %d%s
         Workers:           %d
         Received Until:    %s
         Latency:           %s
@@ -1001,6 +1015,7 @@ Database #%d:
 					fmtYesNo(s.Enabled),
 					s.PubCount,
 					s.TableCount,
+					fmtSeqCount(s.SeqCount),
 					s.WorkerCount,
 					s.ReceivedLSN,
 					fmtMicros(s.Latency),

@@ -736,6 +736,7 @@ type Subscription struct {
 	// following fields present only in schema 1.13 and later
 	ApplyErrorCount int `json:"apply_error_count,omitempty"` // >= pg15
 	SyncErrorCount  int `json:"sync_error_count,omitempty"`  // >= pg15
+	// in postgres v19 and later sync_table_error_count is mapped to sync_error_count
 	// following fields present only in schema 1.20 and later
 	ConflInsertExists           int64 `json:"confl_insert_exists,omitempty"`             // >= pg18
 	ConflUpdateOriginDiffers    int64 `json:"confl_update_origin_differs,omitempty"`     // >= pg18
@@ -744,6 +745,10 @@ type Subscription struct {
 	ConflDeleteOriginDiffers    int64 `json:"confl_delete_origin_differs,omitempty"`     // >= pg18
 	ConflDeleteMissing          int64 `json:"confl_delete_missing,omitempty"`            // >= pg18
 	ConflMultipleUniqueConflict int64 `json:"confl_multiple_unique_conflicts,omitempty"` // >= pg18
+	// following fields present only in schema 1.21 and later
+	SyncSeqErrorCount  int   `json:"sync_seq_error_count,omitempty"` // >= pg19
+	ConflUpdateDeleted int64 `json:"confl_update_deleted,omitempty"` // >= pg19
+	SeqCount           int   `json:"seq_count,omitempty"`            // >= pg19
 }
 
 // Lock represents a single row from pg_locks. Added in schema 1.3.
