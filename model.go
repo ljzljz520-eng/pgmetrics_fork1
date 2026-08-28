@@ -716,6 +716,9 @@ type Publication struct {
 	Update     bool   `json:"update"`
 	Delete     bool   `json:"delete"`
 	TableCount int    `json:"table_count"`
+	// following fields present only in schema 1.21 and later
+	AllSequences bool `json:"allsequences,omitempty"` // >= pg19
+	SeqCount     int  `json:"seq_count,omitempty"`    // >= pg19
 }
 
 // Subscription represents a single v10+ subscription. Added in schema 1.2.

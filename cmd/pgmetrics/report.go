@@ -981,14 +981,22 @@ Database #%d:
 			fmt.Fprintf(fd, `    Logical Replication Publications:
 `)
 			var tw tableWriter
-			tw.add("Name", "All Tables?", "Propagate", "Tables")
+			cols := []interface{}{"Name", "All Tables?", "Propagate", "Tables"}
+			if pg19OrLater {
+				cols = append(cols, "All Sequences?", "Sequences")
+			}
+			tw.add(cols...)
 			for _, p := range pp {
-				tw.add(
+				vals := []interface{}{
 					p.Name,
 					fmtYesNo(p.AllTables),
 					fmtPropagate(p.Insert, p.Update, p.Delete),
 					p.TableCount,
-				)
+				}
+				if pg19OrLater {
+					vals = append(vals, fmtYesNo(p.AllSequences), p.SeqCount)
+				}
+				tw.add(vals...)
 			}
 			tw.write(fd, "      ")
 			gap = true

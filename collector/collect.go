@@ -2721,12 +2721,28 @@ func (c *collector) getPublications() {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
-	q := `WITH pc AS (SELECT pubname, COUNT(*) AS c FROM pg_publication_tables GROUP BY 1)
+	var q string
+	if c.version >= pgv19 {
+		q = `WITH
+				pc AS (SELECT pubname, COUNT(*) AS c FROM pg_publication_tables GROUP BY 1),
+				ps AS (SELECT pubname, COUNT(*) AS c FROM pg_publication_sequences GROUP BY 1)
 			SELECT p.oid, p.pubname, current_database(), puballtables, pubinsert,
-				pubupdate, pubdelete, pc.c
-			FROM pg_publication p JOIN pc ON p.pubname = pc.pubname`
+				pubupdate, pubdelete, COALESCE(pc.c, 0),
+				puballsequences, COALESCE(ps.c, 0)
+			FROM
+				pg_publication p
+				LEFT JOIN pc ON p.pubname = pc.pubname
+				LEFT JOIN ps ON p.pubname = ps.pubname`
+	} else {
+		q = `WITH pc AS (SELECT pubname, COUNT(*) AS c FROM pg_publication_tables GROUP BY 1)
+			SELECT p.oid, p.pubname, current_database(), puballtables, pubinsert,
+				pubupdate, pubdelete, COALESCE(pc.c, 0),
+				FALSE, 0
+			FROM pg_publication p LEFT JOIN pc ON p.pubname = pc.pubname`
+	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
+		log.Printf("warning: pg_publication query failed: %v", err)
 		return // don't fail on errors
 	}
 	defer rows.Close()
@@ -2734,13 +2750,14 @@ func (c *collector) getPublications() {
 	for rows.Next() {
 		var p pgmetrics.Publication
 		if err := rows.Scan(&p.OID, &p.Name, &p.DBName, &p.AllTables, &p.Insert,
-			&p.Update, &p.Delete, &p.TableCount); err != nil {
-			log.Fatalf("pg_publication/pg_publication_tables query failed: %v", err)
+			&p.Update, &p.Delete, &p.TableCount,
+			&p.AllSequences, &p.SeqCount); err != nil {
+			log.Fatalf("pg_publication query failed: %v", err)
 		}
 		c.result.Publications = append(c.result.Publications, p)
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_publication/pg_publication_tables query failed: %v", err)
+		log.Fatalf("pg_publication query failed: %v", err)
 	}
 }
 
