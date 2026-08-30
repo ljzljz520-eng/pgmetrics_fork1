@@ -635,8 +635,16 @@ Vacuum Progress:`)
 }
 
 func reportProgress(fd io.Writer, result *pgmetrics.Model) {
+	// in pg >= v19, use repack instead of cluster
+	pg19OrLater := getVersion(result) >= pgv19
+	var repackCount int
+	if pg19OrLater {
+		repackCount = len(result.RepackProgress)
+	} else {
+		repackCount = len(result.ClusterProgress)
+	}
 	if len(result.VacuumProgress)+len(result.AnalyzeProgress)+
-		len(result.BasebackupProgress)+len(result.ClusterProgress)+
+		len(result.BasebackupProgress)+repackCount+
 		len(result.CopyProgress)+len(result.CreateIndexProgress) == 0 {
 		return // no jobs in progress
 	}
@@ -658,13 +666,25 @@ func reportProgress(fd io.Writer, result *pgmetrics.Model) {
 		tw.add("BASEBACKUP", b.PID, "", b.Phase)
 	}
 
-	// cluster / vacuum full
-	for _, c := range result.ClusterProgress {
-		object := "?"
-		if t := result.TableByOID(c.TableOID); t != nil {
-			object = c.DBName + "." + t.Name
+	// cluster / vacuum full / repack
+	if pg19OrLater {
+		// in pg >= 19, use rows from pg_stat_progress_repack
+		for _, c := range result.RepackProgress {
+			object := "?"
+			if t := result.TableByOID(c.TableOID); t != nil {
+				object = c.DBName + "." + t.Name
+			}
+			tw.add(c.Command, c.PID, object, c.Phase)
 		}
-		tw.add(c.Command, c.PID, object, c.Phase)
+	} else {
+		// in pg < 19, use rows from pg_stat_progress_cluster
+		for _, c := range result.ClusterProgress {
+			object := "?"
+			if t := result.TableByOID(c.TableOID); t != nil {
+				object = c.DBName + "." + t.Name
+			}
+			tw.add(c.Command, c.PID, object, c.Phase)
+		}
 	}
 
 	// copy from / copy to

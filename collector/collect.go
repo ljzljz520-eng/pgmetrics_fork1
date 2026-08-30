@@ -538,6 +538,9 @@ func (c *collector) collectCluster(o CollectConfig) {
 	if c.version >= pgv14 {
 		c.getProgressCopy()
 	}
+	if c.version >= pgv19 {
+		c.getProgressRepack()
+	}
 
 	if c.version >= pgv17 {
 		c.getCheckpointer()
@@ -3275,6 +3278,48 @@ func (c *collector) getProgressCreateIndex() {
 	}
 
 	c.result.CreateIndexProgress = out
+}
+
+func (c *collector) getProgressRepack() {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	q := `SELECT pid, datname, COALESCE(relid::int, 0::int), COALESCE(command, ''),
+				 COALESCE(phase, ''),
+				 COALESCE(repack_index_relid::int, 0),
+				 COALESCE(heap_tuples_scanned, 0::bigint),
+				 COALESCE(heap_tuples_inserted, 0::bigint),
+				 COALESCE(heap_tuples_updated, 0::bigint),
+				 COALESCE(heap_tuples_deleted, 0::bigint),
+				 COALESCE(heap_blks_total, 0::bigint),
+				 COALESCE(heap_blks_scanned, 0::bigint),
+				 COALESCE(index_rebuild_count::int, 0::int)
+		    FROM pg_stat_progress_repack
+		ORDER BY pid ASC`
+
+	rows, err := c.db.QueryContext(ctx, q)
+	if err != nil {
+		log.Printf("warning: pg_stat_progress_repack query failed: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var out []pgmetrics.RepackProgressBackend
+	for rows.Next() {
+		var r pgmetrics.RepackProgressBackend
+		if err := rows.Scan(&r.PID, &r.DBName, &r.TableOID, &r.Command, &r.Phase,
+			&r.RepackIndexOID, &r.HeapTuplesScanned, &r.HeapTuplesInserted,
+			&r.HeapTuplesUpdated, &r.HeapTuplesDeleted,
+			&r.HeapBlksTotal, &r.HeapBlksScanned, &r.IndexRebuildCount); err != nil {
+			log.Fatalf("pg_stat_progress_repack query scan failed: %v", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("pg_stat_progress_repack query rows failed: %v", err)
+	}
+
+	c.result.RepackProgress = out
 }
 
 func (c *collector) getCheckpointer() {

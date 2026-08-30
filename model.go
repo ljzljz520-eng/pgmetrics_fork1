@@ -177,7 +177,7 @@ type Model struct {
 	// progress information from pg_stat_progress_* (see above for vacuum)
 	AnalyzeProgress     []AnalyzeProgressBackend     `json:"analyze_progress,omitempty"`
 	BasebackupProgress  []BasebackupProgressBackend  `json:"basebackup_progress,omitempty"`
-	ClusterProgress     []ClusterProgressBackend     `json:"cluster_progress,omitempty"`
+	ClusterProgress     []ClusterProgressBackend     `json:"cluster_progress,omitempty"` // subset of repack in pg >= v19
 	CopyProgress        []CopyProgressBackend        `json:"copy_progress,omitempty"`
 	CreateIndexProgress []CreateIndexProgressBackend `json:"create_index_progress,omitempty"`
 
@@ -207,6 +207,10 @@ type Model struct {
 	// following fields are present only in schema 1.20 and later
 
 	StatIOs []StatIO `json:"stat_ios,omitempty"`
+
+	// following fields are present only in schema 1.21 and later
+
+	RepackProgress []RepackProgressBackend `json:"repack_progress,omitempty"` // pg >= v19
 }
 
 // DatabaseByOID iterates over the databases in the model and returns the reference
@@ -1052,7 +1056,9 @@ type BasebackupProgressBackend struct {
 }
 
 // ClusterProgressBackend represents a row (and each row represents one
-// backend) from pg_stat_progress_cluster.
+// backend) from pg_stat_progress_cluster. For pg >= 19, this is a
+// subset of pg_stat_progress_repack, for backwards compatibility. See
+// Postgres docs for more info.
 //
 // pg >= 12, schema >= 1.12, pgmetrics >= 1.13.0
 type ClusterProgressBackend struct {
@@ -1105,6 +1111,26 @@ type CreateIndexProgressBackend struct {
 	TuplesDone       int64  `json:"tuples_done"`
 	PartitionsTotal  int64  `json:"partitions_total"`
 	PartitionsDone   int64  `json:"partitions_done"`
+}
+
+// RepackProgressBackend represents a row (and each row represents one
+// backend) from pg_stat_progress_repack.
+//
+// pg >= 19, schema >= 1.21, pgmetrics >= 1.20.0
+type RepackProgressBackend struct {
+	PID                int    `json:"pid"`
+	DBName             string `json:"db_name"`
+	TableOID           int    `json:"table_oid"`
+	Command            string `json:"command"`
+	Phase              string `json:"phase"`
+	RepackIndexOID     int    `json:"repack_index_oid"`
+	HeapTuplesScanned  int64  `json:"heap_tuples_scanned"`
+	HeapTuplesInserted int64  `json:"heap_tuples_inserted"`
+	HeapTuplesUpdated  int64  `json:"heap_tuples_updated"`
+	HeapTuplesDeleted  int64  `json:"heap_tuples_deleted"`
+	HeapBlksTotal      int64  `json:"heap_blks_total"`
+	HeapBlksScanned    int64  `json:"heap_blks_scanned"`
+	IndexRebuildCount  int    `json:"index_rebuild_count"`
 }
 
 // Pgpool contains information collected from Pgpool using "SHOW POOL" commands.
