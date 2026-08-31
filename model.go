@@ -478,6 +478,8 @@ type Table struct {
 	TotalAutovacuumTime  float64 `json:"total_autovacuum_time,omitempty"`  // millisecs, pg >= v18
 	TotalAnalyzeTime     float64 `json:"total_analyze_time,omitempty"`     // millisecs, pg >= v18
 	TotalAutoanalyzeTime float64 `json:"total_autoanalyze_time,omitempty"` // millisecs, pg >= v18
+	// following fields present only in schema 1.21 and later
+	StatsReset int64 `json:"stats_reset,omitempty"` // pg >= v19
 }
 
 type Index struct {
@@ -502,6 +504,8 @@ type Index struct {
 	Definition string `json:"def"`
 	// following fields present only in schema 1.16 and later
 	LastIdxScan int64 `json:"last_idx_scan,omitempty"` // pg >= v16
+	// following fields present only in schema 1.21 and later
+	StatsReset int64 `json:"stats_reset,omitempty"` // pg >= v19
 }
 
 type Sequence struct {
@@ -511,6 +515,8 @@ type Sequence struct {
 	Name       string `json:"name"`
 	BlksRead   int64  `json:"blks_read"`
 	BlksHit    int64  `json:"blks_hit"`
+	// following fields present only in schema 1.21 and later
+	StatsReset int64 `json:"stats_reset,omitempty"` // pg >= v19
 }
 
 type UserFunction struct {
@@ -521,6 +527,8 @@ type UserFunction struct {
 	Calls      int64   `json:"calls"`
 	TotalTime  float64 `json:"total_time"`
 	SelfTime   float64 `json:"self_time"`
+	// following fields present only in schema 1.21 and later
+	StatsReset int64 `json:"stats_reset,omitempty"` // pg >= v19
 }
 
 // VacuumProgressBackend holds the contents of a row from pg_stat_progress_vacuum.

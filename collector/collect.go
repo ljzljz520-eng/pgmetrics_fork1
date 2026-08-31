@@ -1556,7 +1556,7 @@ func (c *collector) getTablesNoRetry(fillSize bool) error {
 			S.n_ins_since_vacuum,
 			@last_seq_scan@, @last_idx_scan@, @n_tup_newpage_upd@,
             CASE WHEN $1 THEN COALESCE(pg_table_size(S.relid), -1) ELSE -1 END,
-            @total_times@
+            @total_times@, @stats_reset@
 		  FROM pg_stat_user_tables AS S
 			JOIN pg_statio_user_tables AS IO
 			ON S.relid = IO.relid
@@ -1588,6 +1588,11 @@ func (c *collector) getTablesNoRetry(fillSize bool) error {
 			"S.total_vacuum_time, S.total_autovacuum_time, S.total_analyze_time, S.total_autoanalyze_time",
 			1)
 	}
+	if c.version < pgv19 { // stats_reset only in pg >= 19
+		q = strings.Replace(q, "@stats_reset@", "0", 1)
+	} else {
+		q = strings.Replace(q, "@stats_reset@", "COALESCE(EXTRACT(EPOCH FROM S.stats_reset)::bigint, 0)", 1)
+	}
 	rows, err := c.db.QueryContext(ctx, q, fillSize)
 	if err != nil {
 		return err
@@ -1609,7 +1614,8 @@ func (c *collector) getTablesNoRetry(fillSize bool) error {
 			&t.RelIsPartition, &tblspcOID, &t.ACL, &t.NInsSinceVacuum,
 			&t.LastSeqScan, &t.LastIdxScan, &t.NTupNewpageUpd,
 			&t.Size, &t.TotalVacuumTime, &t.TotalAutovacuumTime,
-			&t.TotalAnalyzeTime, &t.TotalAutoanalyzeTime); err != nil {
+			&t.TotalAnalyzeTime, &t.TotalAutoanalyzeTime,
+			&t.StatsReset); err != nil {
 			return err
 		}
 		t.Bloat = -1 // will be filled in later
@@ -1662,7 +1668,8 @@ func (c *collector) getIndexesNoRetry(fillSize bool) error {
 			pg_stat_get_blocks_fetched(S.indexrelid) - pg_stat_get_blocks_hit(S.indexrelid) AS idx_blks_read,
 			pg_stat_get_blocks_hit(S.indexrelid) AS idx_blks_hit,
 			C.relnatts, AM.amname, C.reltablespace, @last_idx_scan@,
-			CASE WHEN $1 THEN COALESCE(pg_total_relation_size(S.indexrelid), -1) ELSE -1 END
+			CASE WHEN $1 THEN COALESCE(pg_total_relation_size(S.indexrelid), -1) ELSE -1 END,
+			@stats_reset@
 		FROM pg_stat_user_indexes AS S
 			JOIN pg_class AS C
 			ON S.indexrelid = C.oid
@@ -1673,6 +1680,11 @@ func (c *collector) getIndexesNoRetry(fillSize bool) error {
 		q = strings.Replace(q, "@last_idx_scan@", "0", 1)
 	} else {
 		q = strings.Replace(q, "@last_idx_scan@", "COALESCE(EXTRACT(EPOCH FROM S.last_idx_scan)::bigint, 0)", 1)
+	}
+	if c.version < pgv19 { // stats_reset only in pg >= 19
+		q = strings.Replace(q, "@stats_reset@", "0", 1)
+	} else {
+		q = strings.Replace(q, "@stats_reset@", "COALESCE(EXTRACT(EPOCH FROM S.stats_reset)::bigint, 0)", 1)
 	}
 	rows, err := c.db.QueryContext(ctx, q, fillSize)
 	if err != nil {
@@ -1687,7 +1699,7 @@ func (c *collector) getIndexesNoRetry(fillSize bool) error {
 			&idx.TableName, &idx.Name, &idx.DBName, &idx.IdxScan,
 			&idx.IdxTupRead, &idx.IdxTupFetch, &idx.IdxBlksRead,
 			&idx.IdxBlksHit, &idx.RelNAtts, &idx.AMName, &tblspcOID,
-			&idx.LastIdxScan, &idx.Size); err != nil {
+			&idx.LastIdxScan, &idx.Size, &idx.StatsReset); err != nil {
 			return err
 		}
 		idx.Bloat = -1 // will be filled in later
@@ -1743,9 +1755,14 @@ func (c *collector) getSequences() {
 	defer cancel()
 
 	q := `SELECT relid, schemaname, relname, current_database(), blks_read,
-			blks_hit
+			blks_hit, @stats_reset@
 		  FROM pg_statio_user_sequences
 		  ORDER BY relid ASC`
+	if c.version < pgv19 { // stats_reset only in pg >= 19
+		q = strings.Replace(q, "@stats_reset@", "0", 1)
+	} else {
+		q = strings.Replace(q, "@stats_reset@", "COALESCE(EXTRACT(EPOCH FROM stats_reset)::bigint, 0)", 1)
+	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
 		log.Fatalf("pg_statio_user_sequences query failed: %v", err)
@@ -1755,7 +1772,7 @@ func (c *collector) getSequences() {
 	for rows.Next() {
 		var s pgmetrics.Sequence
 		if err := rows.Scan(&s.OID, &s.SchemaName, &s.Name, &s.DBName,
-			&s.BlksRead, &s.BlksHit); err != nil {
+			&s.BlksRead, &s.BlksHit, &s.StatsReset); err != nil {
 			log.Fatalf("pg_statio_user_sequences query failed: %v", err)
 		}
 		if c.schemaOK(s.SchemaName) {
@@ -1772,9 +1789,14 @@ func (c *collector) getUserFunctions() {
 	defer cancel()
 
 	q := `SELECT funcid, schemaname, funcname, current_database(), calls,
-			total_time, self_time
+			total_time, self_time, @stats_reset@
 		  FROM pg_stat_user_functions
 		  ORDER BY funcid ASC`
+	if c.version >= pgv19 {
+		q = strings.Replace(q, "@stats_reset@", "COALESCE(EXTRACT(EPOCH FROM stats_reset)::bigint, 0)", 1)
+	} else {
+		q = strings.Replace(q, "@stats_reset@", "0", 1)
+	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
 		log.Fatalf("pg_stat_user_functions query failed: %v", err)
@@ -1784,7 +1806,7 @@ func (c *collector) getUserFunctions() {
 	for rows.Next() {
 		var f pgmetrics.UserFunction
 		if err := rows.Scan(&f.OID, &f.SchemaName, &f.Name, &f.DBName,
-			&f.Calls, &f.TotalTime, &f.SelfTime); err != nil {
+			&f.Calls, &f.TotalTime, &f.SelfTime, &f.StatsReset); err != nil {
 			log.Fatalf("pg_stat_user_functions query failed: %v", err)
 		}
 		if c.schemaOK(f.SchemaName) {
