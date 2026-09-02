@@ -554,6 +554,11 @@ func (c *collector) collectCluster(o CollectConfig) {
 		c.getStatLocks()
 	}
 
+	// pg_stat_recovery has rows only while the server is in recovery
+	if c.version >= pgv19 && c.result.IsInRecovery {
+		c.getStatRecovery()
+	}
+
 	if !slices.Contains(o.Omit, "log") && c.local {
 		c.getLogInfo()
 	}
@@ -3469,6 +3474,33 @@ func (c *collector) getStatLocks() {
 	}
 
 	c.result.StatLocks = out
+}
+
+func (c *collector) getStatRecovery() {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	q := `SELECT promote_triggered,
+				COALESCE(last_replayed_read_lsn::text, ''),
+				COALESCE(last_replayed_end_lsn::text, ''),
+				COALESCE(last_replayed_tli, 0),
+				COALESCE(replay_end_lsn::text, ''),
+				COALESCE(replay_end_tli, 0),
+				COALESCE(EXTRACT(EPOCH FROM recovery_last_xact_time)::bigint, 0),
+				COALESCE(EXTRACT(EPOCH FROM current_chunk_start_time)::bigint, 0),
+				COALESCE(pause_state, '')
+			FROM pg_stat_recovery`
+
+	var r pgmetrics.StatRecovery
+	if err := c.db.QueryRowContext(ctx, q).Scan(&r.PromoteTriggered,
+		&r.LastReplayedReadLSN, &r.LastReplayedEndLSN, &r.LastReplayedTLI,
+		&r.ReplayEndLSN, &r.ReplayEndTLI, &r.RecoveryLastXactTime,
+		&r.CurrentChunkStartTime, &r.PauseState); err != nil {
+		log.Printf("warning: pg_stat_recovery query failed: %v", err)
+		return
+	}
+
+	c.result.StatRecovery = &r
 }
 
 //------------------------------------------------------------------------------

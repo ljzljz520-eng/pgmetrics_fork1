@@ -212,6 +212,7 @@ type Model struct {
 
 	RepackProgress []RepackProgressBackend `json:"repack_progress,omitempty"` // pg >= v19
 	StatLocks      []StatLock              `json:"stat_locks,omitempty"`      // pg >= v19
+	StatRecovery   *StatRecovery           `json:"stat_recovery,omitempty"`   // pg >= v19
 }
 
 // DatabaseByOID iterates over the databases in the model and returns the reference
@@ -1284,4 +1285,20 @@ type StatLock struct {
 	WaitTime         float64 `json:"wait_time"` // in milliseconds
 	FastpathExceeded int64   `json:"fastpath_exceeded"`
 	StatsReset       int64   `json:"stats_reset"`
+}
+
+// StatRecovery contains the data from the only row of pg_stat_recovery. It is
+// collected only if the server is in recovery.
+//
+// pg >= 19, schema >= 1.21, pgmetrics >= 1.20.0
+type StatRecovery struct {
+	PromoteTriggered      bool   `json:"promote_triggered"`
+	LastReplayedReadLSN   string `json:"last_replayed_read_lsn"`
+	LastReplayedEndLSN    string `json:"last_replayed_end_lsn"`
+	LastReplayedTLI       int    `json:"last_replayed_tli"`
+	ReplayEndLSN          string `json:"replay_end_lsn"`
+	ReplayEndTLI          int    `json:"replay_end_tli"`
+	RecoveryLastXactTime  int64  `json:"recovery_last_xact_time"`
+	CurrentChunkStartTime int64  `json:"current_chunk_start_time"`
+	PauseState            string `json:"pause_state"`
 }
