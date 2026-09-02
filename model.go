@@ -211,6 +211,7 @@ type Model struct {
 	// following fields are present only in schema 1.21 and later
 
 	RepackProgress []RepackProgressBackend `json:"repack_progress,omitempty"` // pg >= v19
+	StatLocks      []StatLock              `json:"stat_locks,omitempty"`      // pg >= v19
 }
 
 // DatabaseByOID iterates over the databases in the model and returns the reference
@@ -1270,4 +1271,17 @@ type StatIO struct {
 	Fsyncs        int64   `json:"fsyncs"`
 	FsyncTime     float64 `json:"fsync_time"` // in milliseconds
 	StatsReset    int64   `json:"stats_reset"`
+}
+
+// StatLock contains one row from pg_stat_lock, which holds cluster-wide lock
+// statistics with one row per lock type. Rows with no waits and no fastpath
+// overflows are not collected.
+//
+// pg >= 19, schema >= 1.21, pgmetrics >= 1.20.0
+type StatLock struct {
+	LockType         string  `json:"locktype"`
+	Waits            int64   `json:"waits"`
+	WaitTime         float64 `json:"wait_time"` // in milliseconds
+	FastpathExceeded int64   `json:"fastpath_exceeded"`
+	StatsReset       int64   `json:"stats_reset"`
 }

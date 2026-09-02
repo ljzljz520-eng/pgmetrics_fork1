@@ -550,6 +550,10 @@ func (c *collector) collectCluster(o CollectConfig) {
 		c.getStatIOs()
 	}
 
+	if c.version >= pgv19 {
+		c.getStatLocks()
+	}
+
 	if !slices.Contains(o.Omit, "log") && c.local {
 		c.getLogInfo()
 	}
@@ -3432,6 +3436,39 @@ func (c *collector) getStatIOs() {
 	}
 
 	c.result.StatIOs = out
+}
+
+func (c *collector) getStatLocks() {
+	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+	defer cancel()
+
+	q := `SELECT locktype, COALESCE(waits, 0), COALESCE(wait_time, 0),
+				COALESCE(fastpath_exceeded, 0),
+				COALESCE(EXTRACT(EPOCH FROM stats_reset)::bigint, 0)
+			FROM pg_stat_lock
+			WHERE waits > 0 OR wait_time > 0 OR fastpath_exceeded > 0
+			ORDER BY locktype ASC`
+	rows, err := c.db.QueryContext(ctx, q)
+	if err != nil {
+		log.Printf("warning: pg_stat_lock query failed: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	var out []pgmetrics.StatLock
+	for rows.Next() {
+		var r pgmetrics.StatLock
+		if err := rows.Scan(&r.LockType, &r.Waits, &r.WaitTime,
+			&r.FastpathExceeded, &r.StatsReset); err != nil {
+			log.Fatalf("pg_stat_lock query scan failed: %v", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		log.Fatalf("pg_stat_lock query rows failed: %v", err)
+	}
+
+	c.result.StatLocks = out
 }
 
 //------------------------------------------------------------------------------
