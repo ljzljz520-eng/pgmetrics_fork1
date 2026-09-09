@@ -897,12 +897,13 @@ func (c *collector) getWalReceiverv13() {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
-	q := `SELECT status, receive_start_lsn, receive_start_tli,
+	q := `SELECT COALESCE(status, ''), COALESCE(receive_start_lsn::text, ''),
+			COALESCE(receive_start_tli, 0),
 			COALESCE(written_lsn::text, ''), COALESCE(flushed_lsn::text, ''),
-			received_tli, last_msg_send_time, last_msg_receipt_time,
+			COALESCE(received_tli, 0), last_msg_send_time, last_msg_receipt_time,
 			COALESCE(latest_end_lsn::text, ''),
 			COALESCE(EXTRACT(EPOCH FROM latest_end_time)::bigint, 0),
-			COALESCE(slot_name, ''), conninfo, @sender_host@
+			COALESCE(slot_name, ''), COALESCE(conninfo, ''), @sender_host@
 		  FROM pg_stat_wal_receiver`
 	if c.version >= pgv11 {
 		q = strings.Replace(q, "@sender_host@", `COALESCE(sender_host, '')`, 1)
@@ -944,11 +945,12 @@ func (c *collector) getWalReceiverv96() {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
-	q := `SELECT status, receive_start_lsn, receive_start_tli, received_lsn, 
-			received_tli, last_msg_send_time, last_msg_receipt_time,
-			latest_end_lsn,
+	q := `SELECT COALESCE(status, ''), COALESCE(receive_start_lsn::text, ''),
+			COALESCE(receive_start_tli, 0), COALESCE(received_lsn::text, ''),
+			COALESCE(received_tli, 0), last_msg_send_time, last_msg_receipt_time,
+			COALESCE(latest_end_lsn::text, ''),
 			COALESCE(EXTRACT(EPOCH FROM latest_end_time)::bigint, 0),
-			COALESCE(slot_name, ''), conninfo
+			COALESCE(slot_name, ''), COALESCE(conninfo, '')
 		  FROM pg_stat_wal_receiver`
 	var r pgmetrics.ReplicationIn
 	var msgSend, msgRecv sql.NullTime
@@ -3496,6 +3498,9 @@ func (c *collector) getStatRecovery() {
 		&r.LastReplayedReadLSN, &r.LastReplayedEndLSN, &r.LastReplayedTLI,
 		&r.ReplayEndLSN, &r.ReplayEndTLI, &r.RecoveryLastXactTime,
 		&r.CurrentChunkStartTime, &r.PauseState); err != nil {
+		// note: this can fail with ErrNoRows on a >=pg19 standby when the
+		// user does not have pg_read_all_stats privilege, and a warning
+		// gets printed in that case.
 		log.Printf("warning: pg_stat_recovery query failed: %v", err)
 		return
 	}
