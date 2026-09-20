@@ -19,7 +19,7 @@ package collector
 import (
 	"context"
 	"database/sql"
-	"log"
+	"fmt"
 
 	"github.com/rapidloop/pgmetrics"
 )
@@ -27,13 +27,24 @@ import (
 //------------------------------------------------------------------------------
 // PgBouncer
 
-func (c *collector) collectPgBouncer() {
+func (c *collector) collectPgBouncer() error {
 	c.result.PgBouncer = &pgmetrics.PgBouncer{}
-	c.getPBPools()
-	c.getPBServers()
-	c.getPBClients()
-	c.getPBStats()
-	c.getPBDatabases()
+	if err := c.runDomain(domainPBPools, "", c.getPBPools); err != nil {
+		return err
+	}
+	if err := c.runDomain(domainPBServers, "", c.getPBServers); err != nil {
+		return err
+	}
+	if err := c.runDomain(domainPBClients, "", c.getPBClients); err != nil {
+		return err
+	}
+	if err := c.runDomain(domainPBStats, "", c.getPBStats); err != nil {
+		return err
+	}
+	if err := c.runDomain(domainPBDatabases, "", c.getPBDatabases); err != nil {
+		return err
+	}
+	return nil
 }
 
 /*
@@ -55,18 +66,18 @@ func (c *collector) collectPgBouncer() {
  * 1.23: same as 1.22
  * 1.24: (17) database, user, cl_active, cl_waiting, cl_active_cancel_req,
  *            cl_waiting_cancel_req, sv_active, sv_active_cancel,
- *            sv_being_canceled, sv_idle, sv_used, sv_tested, sv_login, maxwait,
- *            maxwait_us, pool_mode, load_balance_hosts
+ *            sv_being_canceled, sv_idle, sv_used, sv_tested, sv_login,
+ *            maxwait, maxwait_us, pool_mode, load_balance_hosts
  * 1.25: same as 1.24
  */
 
-func (c *collector) getPBPools() {
+func (c *collector) getPBPools() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	rows, err := c.db.QueryContext(ctx, "SHOW POOLS")
 	if err != nil {
-		log.Fatalf("pgbouncer: show pools query failed: %v", err)
+		return 0, fmt.Errorf("pgbouncer: show pools query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -75,6 +86,7 @@ func (c *collector) getPBPools() {
 		ncols = len(cols)
 	}
 
+	n := 0
 	for rows.Next() {
 		var pool pgmetrics.PgBouncerPool
 		var maxWaitUs float64
@@ -103,17 +115,20 @@ func (c *collector) getPBPools() {
 				&pool.MaxWait, &maxWaitUs, &pool.Mode, &lbhosts)
 			pool.LoadBalanceHosts = lbhosts.String
 		} else {
-			log.Fatalf("pgbouncer: unsupported number of columns %d in 'SHOW POOLS'", ncols)
+			return n, newDomainError(codeInternalError, fmt.Errorf(
+				"pgbouncer: unsupported number of columns %d in 'SHOW POOLS'", ncols))
 		}
 		if err != nil {
-			log.Fatalf("pgbouncer: show pools query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pgbouncer: show pools query failed: %w", err))
 		}
 		pool.MaxWait += maxWaitUs / 1e6
 		c.result.PgBouncer.Pools = append(c.result.PgBouncer.Pools, pool)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pgbouncer: show pools query failed: %v", err)
+		return n, fmt.Errorf("pgbouncer: show pools query failed: %w", err)
 	}
+	return n, nil
 }
 
 /*
@@ -144,13 +159,13 @@ func (c *collector) getPBPools() {
  * 1.25: same as 1.24
  */
 
-func (c *collector) getPBServers() {
+func (c *collector) getPBServers() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	rows, err := c.db.QueryContext(ctx, "SHOW SERVERS")
 	if err != nil {
-		log.Fatalf("pgbouncer: show servers query failed: %v", err)
+		return 0, fmt.Errorf("pgbouncer: show servers query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -159,6 +174,7 @@ func (c *collector) getPBServers() {
 		ncols = len(cols)
 	}
 
+	n := 0
 	for rows.Next() {
 		var s [18]sql.NullString
 		var state string
@@ -187,10 +203,11 @@ func (c *collector) getPBServers() {
 				&s[7], &s[8], &s[9], &wait, &waitUs, &s[10], &s[11], &s[12],
 				&s[13], &s[14], &s[15], &s[16], &s[17])
 		} else {
-			log.Fatalf("pgbouncer: unsupported number of columns %d in 'SHOW SERVERS'", ncols)
+			return n, newDomainError(codeInternalError, fmt.Errorf(
+				"pgbouncer: unsupported number of columns %d in 'SHOW SERVERS'", ncols))
 		}
 		if err != nil {
-			log.Fatalf("pgbouncer: show servers query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pgbouncer: show servers query failed: %w", err))
 		}
 		wait += waitUs / 1e6 // convert usec -> sec
 		if wait > c.result.PgBouncer.SCMaxWait {
@@ -204,10 +221,12 @@ func (c *collector) getPBServers() {
 		case "used":
 			c.result.PgBouncer.SCUsed++
 		}
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pgbouncer: show servers query failed: %v", err)
+		return n, fmt.Errorf("pgbouncer: show servers query failed: %w", err)
 	}
+	return n, nil
 }
 
 /*
@@ -238,13 +257,13 @@ func (c *collector) getPBServers() {
  * 1.25: same as 1.24
  */
 
-func (c *collector) getPBClients() {
+func (c *collector) getPBClients() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	rows, err := c.db.QueryContext(ctx, "SHOW CLIENTS")
 	if err != nil {
-		log.Fatalf("pgbouncer: show clients query failed: %v", err)
+		return 0, fmt.Errorf("pgbouncer: show clients query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -254,6 +273,7 @@ func (c *collector) getPBClients() {
 	}
 
 	var totalWait float64
+	n := 0
 	for rows.Next() {
 		var s [18]sql.NullString
 		var state string
@@ -275,17 +295,18 @@ func (c *collector) getPBClients() {
 				&s[13], &s[14], &s[15])
 		} else if ncols == 20 {
 			err = rows.Scan(&s[0], &s[1], &s[2], &s[3], &state, &s[4], &s[5], &s[6],
-				&s[7], &s[8], &s[9], &wait, &waitUs, &s[10], &s[11], &s[12], &s[13],
-				&s[14], &s[15], &s[16])
+				&s[7], &s[8], &s[9], &wait, &waitUs, &s[10], &s[11], &s[12],
+				&s[13], &s[14], &s[15], &s[16])
 		} else if ncols == 21 {
 			err = rows.Scan(&s[0], &s[1], &s[2], &s[3], &state, &s[4], &s[5], &s[6],
-				&s[7], &s[8], &s[9], &wait, &waitUs, &s[10], &s[11], &s[12], &s[13],
-				&s[14], &s[15], &s[16], &s[17])
+				&s[7], &s[8], &s[9], &wait, &waitUs, &s[10], &s[11], &s[12],
+				&s[13], &s[14], &s[15], &s[16], &s[17])
 		} else {
-			log.Fatalf("pgbouncer: unsupported number of columns %d in 'SHOW CLIENTS'", ncols)
+			return n, newDomainError(codeInternalError, fmt.Errorf(
+				"pgbouncer: unsupported number of columns %d in 'SHOW CLIENTS'", ncols))
 		}
 		if err != nil {
-			log.Fatalf("pgbouncer: show clients query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pgbouncer: show clients query failed: %w", err))
 		}
 		wait += waitUs / 1e6 // convert usec -> sec
 		switch state {
@@ -302,13 +323,15 @@ func (c *collector) getPBClients() {
 		case "used":
 			c.result.PgBouncer.CCUsed++
 		}
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pgbouncer: show clients query failed: %v", err)
+		return n, fmt.Errorf("pgbouncer: show clients query failed: %w", err)
 	}
 	if c.result.PgBouncer.CCWaiting > 0 {
 		c.result.PgBouncer.CCAvgWait = totalWait / float64(c.result.PgBouncer.CCWaiting)
 	}
+	return n, nil
 }
 
 /*
@@ -340,13 +363,13 @@ func (c *collector) getPBClients() {
  * 1.25: same as 1.24
  */
 
-func (c *collector) getPBStats() {
+func (c *collector) getPBStats() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	rows, err := c.db.QueryContext(ctx, "SHOW STATS")
 	if err != nil {
-		log.Fatalf("pgbouncer: show stats query failed: %v", err)
+		return 0, fmt.Errorf("pgbouncer: show stats query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -355,9 +378,9 @@ func (c *collector) getPBStats() {
 		ncols = len(cols)
 	}
 
+	n := 0
 	for rows.Next() {
 		var stat pgmetrics.PgBouncerStat
-		var err error
 		if ncols == 15 {
 			err = rows.Scan(&stat.Database, &stat.TotalXactCount, &stat.TotalQueryCount,
 				&stat.TotalReceived, &stat.TotalSent, &stat.TotalXactTime,
@@ -384,10 +407,11 @@ func (c *collector) getPBStats() {
 				&stat.AvgQueryTime, &stat.AvgWaitTime, &stat.AvgClientParseCount,
 				&stat.AvgServerParseCount, &stat.AvgBindCount)
 		} else {
-			log.Fatalf("pgbouncer: unsupported number of columns %d in 'SHOW STATS'", ncols)
+			return n, newDomainError(codeInternalError, fmt.Errorf(
+				"pgbouncer: unsupported number of columns %d in 'SHOW STATS'", ncols))
 		}
 		if err != nil {
-			log.Fatalf("pgbouncer: show stats query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pgbouncer: show stats query failed: %w", err))
 		}
 		// convert usec -> sec
 		stat.TotalXactTime /= 1e6
@@ -397,10 +421,12 @@ func (c *collector) getPBStats() {
 		stat.AvgQueryTime /= 1e6
 		stat.AvgWaitTime /= 1e6
 		c.result.PgBouncer.Stats = append(c.result.PgBouncer.Stats, stat)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pgbouncer: show stats query failed: %v", err)
+		return n, fmt.Errorf("pgbouncer: show stats query failed: %w", err)
 	}
+	return n, nil
 }
 
 /*
@@ -427,13 +453,13 @@ func (c *collector) getPBStats() {
  * 1.25: same as 1.24
  */
 
-func (c *collector) getPBDatabases() {
+func (c *collector) getPBDatabases() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	rows, err := c.db.QueryContext(ctx, "SHOW DATABASES")
 	if err != nil {
-		log.Fatalf("pgbouncer: show databases query failed: %v", err)
+		return 0, fmt.Errorf("pgbouncer: show databases query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -442,6 +468,7 @@ func (c *collector) getPBDatabases() {
 		ncols = len(cols)
 	}
 
+	n := 0
 	for rows.Next() {
 		var db pgmetrics.PgBouncerDatabase
 		var host, user sql.NullString
@@ -467,18 +494,21 @@ func (c *collector) getPBDatabases() {
 				&paused, &disabled)
 			db.LoadBalanceHosts = lbhosts.String
 		} else {
-			log.Fatalf("pgbouncer: unsupported number of columns %d in 'SHOW DATABASES'", ncols)
+			return n, newDomainError(codeInternalError, fmt.Errorf(
+				"pgbouncer: unsupported number of columns %d in 'SHOW DATABASES'", ncols))
 		}
 		if err != nil {
-			log.Fatalf("pgbouncer: show databases query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pgbouncer: show databases query failed: %w", err))
 		}
 		db.Host = host.String
 		db.Paused = paused == 1
 		db.Disabled = disabled == 1
 		db.User = user.String
 		c.result.PgBouncer.Databases = append(c.result.PgBouncer.Databases, db)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pgbouncer: show databases query failed: %v", err)
+		return n, fmt.Errorf("pgbouncer: show databases query failed: %w", err)
 	}
+	return n, nil
 }

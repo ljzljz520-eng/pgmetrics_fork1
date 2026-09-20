@@ -16,6 +16,10 @@
 
 package collector
 
-func (c *collector) collectSystem(o CollectConfig) {
-	// Not implemented for Darwin yet.
+// collectSystem is unreachable on non-Linux platforms: callers gate the
+// system domain with a platform_unsupported skip before dispatching here.
+// The defensive skip is kept in case the gate is bypassed by mistake.
+func (c *collector) collectSystem(o CollectConfig) (int, error) {
+	c.skipPlatform(domainSystem, "", "system metrics collection is supported on Linux only")
+	return 0, nil
 }

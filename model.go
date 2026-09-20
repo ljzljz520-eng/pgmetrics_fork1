@@ -19,6 +19,7 @@ package pgmetrics
 // ModelSchemaVersion is the schema version of the "Model" data structure
 // defined below. It is in the "semver" notation. Version history:
 //
+//	1.22 - versioned collection outcome contract (the "collection" field)
 //	1.21 - Postgres 19 support
 //	1.20 - Add subscription conflict stats, IO stats, pgbouncer 1.25 support
 //	1.19 - Postgres 18 support
@@ -42,7 +43,7 @@ package pgmetrics
 //	1.2 - more table and index attributes
 //	1.1 - added NotificationQueueUsage and Statements
 //	1.0 - initial release
-const ModelSchemaVersion = "1.21"
+const ModelSchemaVersion = "1.22"
 
 // Model contains the entire information collected by a single run of
 // pgmetrics. It can be converted to and from json without loss of
@@ -213,6 +214,12 @@ type Model struct {
 	RepackProgress []RepackProgressBackend `json:"repack_progress,omitempty"` // pg >= v19
 	StatLocks      []StatLock              `json:"stat_locks,omitempty"`      // pg >= v19
 	StatRecovery   *StatRecovery           `json:"stat_recovery,omitempty"`   // pg >= v19
+
+	// following fields are present only in schema 1.22 and later
+
+	// per-domain collection status, shared by all output formats; absent
+	// in snapshots written by older releases and when replaying such files
+	Collection *CollectionReport `json:"collection,omitempty"`
 }
 
 // DatabaseByOID iterates over the databases in the model and returns the reference

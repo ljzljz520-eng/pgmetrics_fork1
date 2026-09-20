@@ -1,0 +1,261 @@
+# 统一采集执行器与版本化 CollectionOutcome 契约 - 实现计划
+
+## Task 1: 契约类型与版本化模型（model 层）
+- **Status**: `completed`
+- **Completion Evidence**:
+  - TR-1.1/1.2 通过：新增 [outcome.go](file:///Users/nancy/swe-project/pgmetrics_fork1/outcome.go)（六态/策略/总体状态常量、`DomainOutcome`/`CollectionReport`、Record/Outcome/Aggregate/Finalize/ExitCode/CountByStatus）、[outcome_test.go](file:///Users/nancy/swe-project/pgmetrics_fork1/outcome_test.go)（7 个测试函数全部通过）；[model.go](file:///Users/nancy/swe-project/pgmetrics_fork1/model.go) 版本升 1.22、附加 `Collection *CollectionReport` 字段。
+  - `go test ./...`、`go vet ./...` 退出 0；旧快照 JSON（无 collection）序列化省略该键且可无损反序列化。
+- **Priority**: high
+- **Depends On**: None
+- **Description**:
+  - 在 model.go（或新增 `outcome.go` 于 `pgmetrics` 包）定义六态常量（`CollectionStatusSuccess/Omitted/Unsupported/PermissionDenied/Timeout/Failed`，线值 `success/omitted/unsupported/permission_denied/timeout/failed`）、策略常量（`best_effort/strict`）、总体状态常量（`success/degraded/failed/aborted`）、契约版本常量 `CollectionContractVersion = "1.0"`。
+  - 定义 `DomainOutcome`（JSON 键：`domain,target,omitempty,status,started_at,ended_at,duration_millis,code,omitempty,summary,omitempty,rows,omitempty`）与 `CollectionReport`（`contract_version,policy,status,started_at,ended_at,outcomes`）。
+  - `Model` 增加附加字段 `Collection *CollectionReport \`json:"collection,omitempty"\``；`ModelSchemaVersion` 改为 `1.22` 并补注释行。
+  - 实现纯方法：`(*CollectionReport).Record(DomainOutcome) bool`（同 `(domain,target)` 重复登记时忽略并返回 false，不 panic）、`Outcome(domain,target) (DomainOutcome,bool)` 查询、`Aggregate() string` 重算总体状态：aborted 已显式置位时透传；否则有必需域失败类状态→failed；仅有可选域失败类→degraded；其余→success；omitted/unsupported 不降级。
+  - `DomainOutcome.Required bool \`json:"-"\\``：由执行器按域登记表填写，仅内部聚合使用，不参与 JSON。
+  - 单元测试（`outcome_test.go`，pgmetrics 包）：Record 唯一性、Aggregate 四态（全 success/可选失败 degraded/必需失败 failed/aborted 透传）、JSON round-trip 含与不含 collection 字段两种 Model。
+- **Acceptance Criteria Addressed**: AC-1, AC-5（类型部分）, AC-10
+- **Test Requirements**:
+  - `rule` TR-1.1: `go test ./...` 覆盖：六态/总体状态常量线值正确；同键重复 Record 不产生第二条；Aggregate 四态判定正确（含 omitted/unsupported 不降级）。
+  - `rule` TR-1.2: JSON 序列化断言含 `collection.contract_version="1.0"`、`meta.version="1.22"`；旧 Model（Collection=nil）序列化结果不含 collection 键；反序列化 1.21 形态 JSON（无 collection）成功且字段无损。
+- **Notes**: 时间戳 Unix 秒 + duration_millis；Required 不进 JSON（`json:"-"`）。
+
+## Task 2: 错误分类器、稳定错误码与脱敏器（纯逻辑 + 单测）
+- **Status**: `completed`
+- **Completion Evidence**:
+  - TR-2.1/2.2 通过：[collector/outcome.go](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/outcome.go)（19 个稳定错误码、`DomainError`、`classify` SQLSTATE/context/net 分类、`sanitize` KV+URI 脱敏、`joinSummary`）+ [collector/outcome_test.go](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/outcome_test.go)（19 个分类子用例 + 9 个脱敏子用例全绿）。
+  - `go test ./collector/ -v` 全绿；脱敏对 `s3cr3t`/`p%40ss` 等明文零命中且幂等。
+- **Priority**: high
+- **Depends On**: Task 1
+- **Description**:
+  - 新增 `collector/outcome.go`：稳定错误码常量（至少：`conn_failed/auth_failed/insufficient_privilege/statement_timeout/lock_timeout/context_deadline/undefined_object/extension_absent/scan_error/query_error/version_unsupported/platform_unsupported/aurora_unsupported/feature_disabled/not_local/disabled_by_option/io_error/internal_error`）。
+  - `type DomainError struct { Code string; Err error }` 实现 `Error()/Unwrap()`；构造助手 `NewDomainError(code, err)`。
+  - `classify(err) (status, code string)`：pgconn.PgError SQLSTATE 映射（42501/28000/28P01→permission_denied；57014→timeout/statement_timeout；55P03→timeout/lock_timeout；42P01/42P02/42883→unsupported/undefined_object；其余 failed/query_error）；`context.DeadlineExceeded`→timeout/context_deadline；`context.Canceled`→failed/query_error；网络/驱动错误（`*net.OpError` 等）→failed/conn_failed；`*DomainError` 保留 code 并按 code 反推状态；nil→success；未知→failed/internal? `query_error`。
+  - `sanitize(s string) string`：KV 形态（`(password|sslpassword|passfile|sslcert? 不脱敏)\s*=\s*('[^']*'|\S+)`，其中含空格值带引号形态也要覆盖）与 URI 形态（`(postgres(?:ql)?://)[^:/?#\s]*:([^@/?#\s]*)@`）统一替换为固定掩码（如 `password=****`、`$1****:****@`，保留 scheme 与主机）；幂等。
+  - 表驱动单测 `outcome_test.go`（collector 包）：全部上述分支 + ErrNoRows 不在此处特判（在执行器层按域处理）。
+- **Acceptance Criteria Addressed**: AC-3, AC-9
+- **Test Requirements**:
+  - `rule` TR-2.1: 分类表驱动单测：42501/28000/28P01/57014/55P03/42P01/42P02/42883/未知 SQLSTATE/DeadlineExceeded/Canceled/nil/DomainError 包装，断言 (status,code) 与 FR-10 一致。
+  - `rule` TR-2.2: 脱敏单测：KV（带引号含空格密码、裸值）、URI（含 URL 编码密码 `p%40ss`）、密码出现在错误串中部、无密码串原样保留、重复调用幂等；输出对原始密码字节零命中。
+
+## Task 3: 统一执行器、域登记表与采集器编排接线
+- **Status**: `completed`
+- **Completion Evidence**:
+  - 新增 [collector/executor.go](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/executor.go)：模式常量、~50 个稳定域名常量、`domainSpec`/`domainCatalog`（必需性按 FR-12）、`runDomain`（终态去重/skip 检测/rows 透传/时间戳/分类/脱敏 warning）、`recordFailure`/`runFatal`/`skip`/`skipOption`/`skipVersion`/`skipPlatform`、严格模式 abort 上卷。
+  - [collector/collect.go](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/collect.go) 接线：`CollectConfig.Strict`；`Collect` 包装器 + `CollectWithReport`（初始化 report、`connection` 域含 Ping 前置验证、`database_list` 域、多库循环单库失败尽力继续/严格中止、finish 聚合并挂 `model.Collection`）；`getConn/getDBNames/collectFromDB` 返回 error；collector struct 加 report/strict/aborted；collectFirst/collectPostgres/collectNext/collectCluster/collectDatabase 签名返回 error（函数体 Task 4-8 改造，当前骨架返回 nil）。
+  - TR-3.1~3.4 通过：[collector/executor_test.go](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/executor_test.go) 9 个测试函数（尽力两失败俱在+failed+exit1、严格 required abort+errAborted+后续不调度、严格可选继续+degraded+exit0、rows/时间戳、skip 终态、脱敏摘要、nil report exit0、登记表完整性与 FR-12 核心必需集）；`go build ./... && go test ./... && go vet ./...` 退出 0。
+- **Priority**: high
+- **Depends On**: Task 2
+- **Description**:
+  - 在 collector 包新增执行器（`executor.go` 或并入 outcome.go）：
+    - `domainSpec{ name string; required bool; modes string[] }` 与集中登记表 `domainCatalog`，覆盖 FR-6/FR-7 全部域名；查询辅助 `isRequired(domain, mode)`。
+    - `collector` 增加 `report *pgmetrics.CollectionReport`、策略（从 `CollectConfig.Strict` 读取）、abort 通道；`newCollector(...)` 初始化 report（contract/policy/started_at）。
+    - 执行器核心：`runDomain(domain, target string, fn func() (rows int, err error))`：打时间戳→调 fn→错误分类→sanitize(fmt 错误)→记录 DomainOutcome（Required 来自登记表）；`sql.ErrNoRows` 由域函数自行转为 (0,nil) 或执行器按可选参数处理——定为域函数负责语义转换，执行器只认 error。
+    - 跳过登记：`omit(domain, target, code, summary, status)` 统一落 omitted/unsupported（不打时间消耗或按真实瞬时记录，status 非 success 时 duration_millis=0）。
+    - 尽力模式：runDomain 吞掉错误仅记录；严格模式：required 域失败→置 `status=aborted`、停止后续调度（通过返回 abort error 沿 collectCluster/collectDatabase/collectFromDB 向上返回，CollectWithReport 收尾返回）；可选域失败不中止。
+    - stderr 反馈：执行器在非 success（omitted/unsupported 除外，避免噪声；warning 类=timeout/denied/failed）时以脱敏摘要输出一行 warning；严格中止输出致命行（仍由 CLI 决定退出码，collector 不 os.Exit）。
+  - 连接层改造：`getConn` 返回 `(*sql.DB, error)`（SET ROLE/角色名校验错误返回而非 Fatal）；`getDBNames` 返回 `([]string, error)`；`collectFromDB` 返回 error；`Collect` 包装新 API；新增 `CollectWithReport(o, dbnames) (*Model, *CollectionReport)`（report 同时挂到 `model.Collection`）；连接/列库失败由编排记 `connection`/`database_list` 域并按策略继续/中止；多库循环中单库连接失败尽力模式继续其余库。
+  - 聚合与退出码纯函数（pgmetrics 包）：`(*CollectionReport).ExitCode() int`（aborted/required 失败→1，否则 0）与 `HasRequiredFailure()`。
+  - 单测：用假 fn 注入成功/错误/必需可选 × 严格尽力组合；omit 登记；键唯一；时间戳/duration 合理性（注入时钟或容忍断言）。
+- **Acceptance Criteria Addressed**: AC-2, AC-4（执行器侧）, AC-5, AC-6, AC-7（决策函数）, AC-11
+- **Test Requirements**:
+  - `rule` TR-3.1: 尽力模式下必需域与可选域均失败：两条 outcome 俱在、runDomain 均正常返回、Aggregate=failed、ExitCode=1；严格模式必需域失败：后续 fn 不被调用、status=aborted；严格模式可选域失败：后续继续。
+  - `rule` TR-3.2: success outcome rows 透传；started_at≤ended_at、duration_millis≥0；summary 经注入密码错误后不含明文。
+  - `rule` TR-3.3: 域登记表与 FR-6/FR-7 清单一致性单测（名称集合断言），每域 required/modes 元数据符合 FR-12。
+  - `rule` TR-3.4: 全 success（含 omitted/unsupported）时 ExitCode=0；仅可选失败 degraded 时 ExitCode=0。
+
+## Task 4: postgres 基础域改造（连接/用户/设置/系统信息/版本门控骨架）
+- **Status**: `completed`
+- **Completion Evidence**:
+  - `getCurrentUser() error`、`getSettings() (int,error)`、`getLocal() error`、`getCurrentDatabase() (string,error)` 全部转换，log.Fatal* 消除；server_version_num 解析并入 settings 域（坏值→codeQueryError）；local_probe 保持容错语义：探测失败记 success+脱敏 summary、local=false。
+  - collectFirst 三模式 current_user 经 runDomain（pgbouncer 无该域，符合登记表）；unknown mode→runFatal(init,internal_error)；collectPostgres 经 settings/local_probe→collectCluster→collectDatabase 错误上卷；collector 新增 curTarget，collectFromDB 每目标注入，current_database 以 curTarget 为 target，best-effort 失败时跳过该库其余域。
+  - 门控→skip 接线：版本门控统一走 `runVersioned(domain, requires, minVersion, fn)`（不足记 unsupported/version_unsupported）；feature 门控（track_commit_timestamp→omitted/feature_disabled、stat_recovery 非恢复态→omitted/feature_disabled）、Aurora 门控（replication_incoming 编排层、wal 域函数内→unsupported/aurora_unsupported）、AWS RDS pg_ls_dir 不可用→unsupported/platform_unsupported。system/logs 的非 linux/非 local 门控随 Task 8 落地。
+  - TR-4.1/4.2：`go build ./...` 通过；已改造函数 grep `log\.(Fatal|Fatalf)` 零命中；版本/feature/Aurora/平台四类门控均有对应 skip 登记（collectCluster 内 13 个 runVersioned + 3 个特性 skip 点，走查逐一对应）。
+- **Priority**: high
+- **Depends On**: Task 3
+- **Description**:
+  - `getCurrentUser`、`getSettings`、`getPGSystemInfo`、`getCurrentDatabase` 改为返回 error（经 runDomain 调用，域名 current_user/settings/system_info/current_database）；移除内部 log.Fatal*。
+  - `collectFirst/collectPostgres` 改为返回 error 并经执行器登记：server_version_num 解析失败归入 settings/system_info 失败；`getLocal` 改为 `local_probe` 域（错误不再静默：失败时 success+结果 false 仍记 success——保持现行“不失败”语义但有记录；或按 query error——定为 success rows=1，local=false，因现行语义即容错）。
+  - 在 collectCluster/collectDatabase 调度点把门控改为显式 skip 登记：因 `--omit`/`--no-sizes` 不执行→omit(disabled_by_option)；版本不足→omit 状态 unsupported(version_unsupported)；非 linux 的 collectSystem→unsupported(platform_unsupported)；非 local 的 system/logs→omitted(not_local)；track_commit_timestamp 关闭→omitted(feature_disabled)；Aurora 函数跳过→unsupported(aurora_unsupported)。本任务先搭门控→skip 的接线骨架并覆盖 collectCluster/collectDatabase 中所有分支，后续任务把具体函数体改为返回 error 后门控点自然生效。
+  - `unknown mode` Fatal 改为返回 error（CollectWithReport 层记 failed）。
+- **Acceptance Criteria Addressed**: AC-2, AC-4, AC-8（状态来源）
+- **Test Requirements**:
+  - `rule` TR-4.1: `grep -nE 'log\.(Fatal|Fatalf)' collector/collect.go` 在已改造函数中零命中；`go build ./...` 通过。
+  - `rule` TR-4.2: 门控分支代码走查：每个 `c.version < pgvXX`/Omit/local/Aurora 跳过点对应一条 omit()/unsupported 登记（审查清单与 grep `c.version` 结果逐一对应）。
+
+## Task 5: collectCluster 域函数全量改造（cluster 级 SQL 域）
+- **Status**: `completed`
+- **Completion Evidence**:
+  - 46 个 cluster 叶子函数全部改为 `(int,error)`（含 getWALArchiver/getBGWriter×2/getReplication×2/getWalReceiver×2/getAdminFunc×2/getLastXactv95/getPGSystemInfo/getControlSystemv96/getControlCheckpoint×3/getActivity×3/getBETypeCountsv10/getDatabases/getTablespaces/getRoles/getReplicationSlotsv94/getWALCounts×4/getNotification/getLocks 族 4 个/getWAL×2/getVacuumProgress×2/getCheckpointer/getStatIOs/getStatLocks/getStatRecovery/getProgress×7）：Query 失败 `fmt.Errorf %w`、Scan 失败 `newDomainError(codeScanError,...)`、坏 xid `codeInternalError`；标量域 rows=1，切片域 rows=扫描行数。
+  - 特殊语义保留并显式化：getWalReceiver ErrNoRows→(0,nil) 空态 success；fillDatabaseSize/fillTablespaceSize 逐行失败仍填 -1 不产生 outcome（spec 明确豁免）；getWALCountsActual 原"need superuser"静默改为错误上卷（42501 经分类器落 permission_denied，模型字段保持 -1）；Aurora/特性门控见 Task 4 证据。
+  - collectCluster 调度体重写：26 个域 runDomain/runVersioned 登记点 + stat_recovery 双门控，每个 FR-6 cluster 域名有且仅有一个登记点；严格模式 errAborted 逐域上卷。
+  - TR-5.1：构建通过；collect.go cluster 区间（约 L835-L3839）log.Fatal*/warning 零残留（剩余命中全部在单库域/日志/云域，属 Task 6/8 范围）。
+  - TR-5.2：SQL 文本与 Scan 目标零改动（仅错误处理/签名/调度 diff）；ErrNoRows 空态域 success。
+  - TR-5.3 评分：**5/5**——全部 cluster 域统一经执行器、无错误吞没（-1 填充为规格豁免的域内容错，非旁路）；证据：collectCluster 单一调度表 + grep 零残留 + `go test ./... && go vet ./...` 全绿。
+- **Priority**: high
+- **Depends On**: Task 4
+- **Description**:
+  - 将 collect.go 中 cluster 级全部 get* 函数改为返回 error 并经 runDomain 登记（域命名按 FR-6）：
+    - getControlSystemv96→control_system；getControlCheckpointv96/v10/v11→control_checkpoint（含 fixAuroraCheckpoint、坏 xid 错误返回 internal/query_error 而非 Fatal）；getLastXactv95→last_xact；getBGWriterv17/getBGWriter→bg_writer；getWALArchiver→wal_archiver；getActivityv93/v94/v96→activity；getBETypeCountsv10→backend_type_counts；getReplicationv9/v10→replication_outgoing（Query 失败 warning→返回错误交执行器；Scan/rows.Err 同样返回）；getWalReceiverv96/v13→replication_incoming（ErrNoRows→(0,nil) 空态 success）；getAdminFuncv9/v10→recovery（内部 pg_is_*_paused/wal lsn 子错误返回；Aurora 分支保留）；getDatabases→databases（fillDatabaseSize 逐行失败保留 -1 约定，不产生 outcome）；getTablespaces→tablespaces（同上 fillTablespaceSize）；getRoles→roles；getReplicationSlotsv94→replication_slots；getWALCountsv12/v11/无版/getWALCountsActual→wal_counts；getNotification→notification；getLocks/getLockRows/getBlockers96/getBlocker→locks；getWAL/getWALv18→wal；getVacuumProgressv96/v17→vacuum_progress。
+  - 所有 `log.Fatalf`/Query 失败 warning 点改为 `return NewDomainError(code,...)` 或裸 error 交执行器分类；Scan 错误用 scan_error 包装。
+  - collectCluster 调度体改为 runDomain 调用 + 门控 skip（Task 4 骨架落地），返回 error 供严格模式上卷。
+- **Acceptance Criteria Addressed**: AC-2, AC-3, AC-4, AC-11, AC-12
+- **Test Requirements**:
+  - `rule` TR-5.1: 构建通过；collect.go 指定行区间内无 log.Fatal*/log.Print warning 残留（grep 证据，注释除外）；每个 FR-6 cluster 域名在调度中有且仅有一个 runDomain 登记点。
+  - `rule` TR-5.2: 代码审查：SQL 文本与 Scan 目标列零改动（diff 仅错误处理/签名/调度），ErrNoRows 空态域返回 success。
+  - `rubric` TR-5.3: 改造一致性；scale 1-5；1=多处仍自行打印/错误吞没；3=主域统一、≤2 处旁路；5=全部域统一走执行器、错误无吞没；threshold >=4；证据为 diff 审查。
+
+## Task 6: collectDatabase 单库域 + citus.go 改造
+- **Status**: `completed`
+- **Completion Evidence**:
+  - collectDatabase 编排体重写：13 个单库域全部带 target=c.curTarget 经 runDomain/runDBOption/runDBVersioned 登记（tables 含 partition/parent 域内步骤；indexes 与独立 index_defs 域；sequences/functions/extensions/triggers/statements/bloat/publications/subscriptions/citus），omit 11 项每项有显式 omitted(disabled_by_option) 路径，publications/subscriptions <10 记 unsupported/version_unsupported。
+  - 24 个单库叶子函数改 `(int,error)`：getTables/NoRetry、getIndexes/NoRetry（lock_timeout 去尺寸重试保留，重试成功经 `c.note()` 在 success outcome 附公开摘要）、getIndexDef（原静默吞错改为错误上卷）、getSequences/getUserFunctions/getExtensions/getDisabledTriggers/getStatements 分发+7 变体（扩展缺失/跨库去重→skip extension_absent/feature_disabled）、getBloat、getPublications、getSubscriptions、getPartitionInfo、getParentInfo；Scan 错统一 codeScanError。
+  - citus.go 全量改造：getCitus 及 11 个子函数；扩展缺失/citus_version 失败→skip(extension_absent) 保持"无 Citus 非失败"（version 失败摘要经 sanitize）；Citus Enterprise 良性分支保留；citus.go log 命中归零。
+  - TR-6.1：两文件运行时路径无 log.Fatal*（grep 剩余仅日志/云域）；构建通过。
+  - TR-6.2：lock_timeout 重试路径走查——isLockTimeoutError(55P03)→NoRetry(false) 成功→success+note "sizes skipped"；二次失败错误上卷为 timeout/lock_timeout 分类。
+  - TR-6.3：FR-6 单库 13 域名登记点唯一（collectDatabase 单一调度表）；omit 各项对应 skipped 记录。
+  - TR-6.4 评分：**5/5**——单库域与 citus 全部经执行器、无静默吞错（原 getIndexDef 静默点已收口）、重试/skip 语义显式；gofmt/build/test/vet 全绿。
+- **Priority**: high
+- **Depends On**: Task 4
+- **Description**:
+  - collect.go 单库级函数改造（target=当前库名）：getTables/getTablesNoRetry→tables（保留 lock_timeout 去尺寸重试；按 FR-13 落 success+摘要 或错误上卷）；getIndexes/getIndexesNoRetry→indexes；getIndexDef→indexes 子项（失败不拖垮 indexes：indexdefs 单独 outcome `index_defs`，--omit indexdefs→omitted）；getPartitionInfo/getParentInfo 并入 tables 域（作为函数内步骤，错误返回）；getSequences→sequences；getUserFunctions→functions；getExtensions→extensions；getDisabledTriggers→triggers；getStatements(v18/v19/v110/v111/v112/v113/Prev18 全套)→statements（Query 失败 warning→error；扩展缺失经 42P01 自动落 unsupported）；getBloat→bloat；getPublications→publications；getSubscriptions→subscriptions。
+  - citus.go：getCitus 及全部子函数改为返回 error/经执行器：`citus` 域；citus_version 失败→unsupported(extension_absent)（保持“无 Citus 不算失败”语义）；其余 warning 点上卷为 citus 域 error（尽力模式由执行器记 failed 并继续）。
+  - collectDatabase 调度体改为 runDomain + 门控（版本/omit），重复库保护逻辑保留；返回 error。
+- **Acceptance Criteria Addressed**: AC-2, AC-3, AC-4, AC-6, AC-12
+- **Test Requirements**:
+  - `rule` TR-6.1: 构建通过；collect.go 与 citus.go 运行时路径无 log.Fatal*；citus.go warning 点全部改为 error 返回（grep 证据）。
+  - `rule` TR-6.2: lock_timeout 重试路径单测级验证不可行（需 DB），改为代码走查证据：重试成功路径 outcome 为 success 且 code/summary 标注 size skipped；失败路径错误上卷。
+  - `rule` TR-6.3: FR-6 单库域名在 collectDatabase/citus 中登记点唯一；omit 列表 11 项每项对应 omitted 记录路径。
+  - `rubric` TR-6.4: 改造一致性同 TR-5.3 尺度；threshold >=4。
+
+## Task 7: pgbouncer.go 与 pgpool.go 模式改造
+- **Status**: `completed`
+- **Completion Evidence**:
+  - pgbouncer.go 重写：collectPgBouncer() error 经 runDomain 调度 5 域（pb_pools/pb_servers 必需，pb_clients/pb_stats/pb_databases 可选，catalog 已落 mode=pgbouncer）；5 个 getPB* 改 (int,error)；Query/rows.Err→fmt.Errorf %w，Scan→newDomainError(codeScanError)，列数不匹配→newDomainError(codeInternalError)；n=实际扫描行数；log.Fatalf 零残留（log import 已删）。
+  - pgpool.go 重写：collectPgpool() error 调度 pp_version（必需，闭包接回 semversion）/pp_nodes（必需）/pp_health_stats/pp_backend_stats/pp_cache（可选，mode=pgpool）；getPPVersion 改 (string,error)，坏版本串→newDomainError(codeQueryError)；<4.2 两个 stats 域显式 c.skipVersion；列数不匹配 internal_error；Fatal 零残留。
+  - collectFirst 接线：pgbouncer/pgpool 分支错误上卷（严格必需失败→errAborted）。
+  - TR-7.1：grep `log\.Fatal|os\.Exit` 两文件零命中；`go build ./...` 通过。
+  - TR-7.2 走查：FR-7 十域名与 domainCatalog/调度点三方一致；必需性符合 FR-12；query/列数/scan/rows.Err 四类错误路径均返回 error；postgres 模式不登记 pb/pp 域（modes 过滤）。
+- **Priority**: high
+- **Depends On**: Task 3
+- **Description**:
+  - pgbouncer.go：collectPgBouncer 改为经执行器调度 pb_pools/pb_servers/pb_clients/pb_stats/pb_databases；五个 getPB* 函数返回 error；列数不匹配→failed(internal/query_error)；所有 Fatal 点改 error 上卷；必需域 pb_pools/pb_servers 失败时严格中止、尽力继续其余可执行部分。
+  - pgpool.go：getPPVersion→pp_version（坏版本字符串错误返回）、getPPNodes→pp_nodes、getPPHCStats→pp_health_stats、getPPBEStats→pp_backend_stats、getPPCache→pp_cache；collectPgpool 调度接线；Fatal 全部消除。
+  - 模式相关域登记：postgres 模式不登记 pb_*/pp_*，反之亦然（Task 3 登记表 modes 落地）。
+- **Acceptance Criteria Addressed**: AC-2, AC-4, AC-6, AC-12
+- **Test Requirements**:
+  - `rule` TR-7.1: 两文件 `log.Fatal*` 零命中（grep）；`go build ./...` 通过。
+  - `rule` TR-7.2: 代码走查：FR-7 五+五域名登记点齐全；必需/可选元数据符合 FR-12；错误路径（query/列数/scan/rows.Err）均返回 error。
+
+## Task 8: 日志、系统指标与云域改造（log.go / aws.go / azure.go / system_*.go）
+- **Status**: `completed`
+- **Completion Evidence**:
+  - logs 域：新增 runLogsDomain 门控（--omit=log→omitted(disabled_by_option)；非本机→omitted(not_local)；否则 runDomain 执行），仅 postgres 模式登记；collectLogs 改 (int,error)：--log-file/--log-dir 定位失败与"猜不到日志位置"→failed(io_error)；getPrefix 改 (bool,string)，log_line_prefix 缺失或无时间戳转义→omitted(feature_disabled)+脱敏原因（非 IO 问题，不伪造 io_error）；readLogs 聚合单文件错误：全部失败→failed(io_error)，部分失败→success+note 标注"N of M files unreadable: …"，rows=解析日志条数；auto_explain xml/yaml 不支持由 noteOnce 落摘要；processLogBuf 不逐条 outcome。
+  - system 域：collectPostgres 三分支门控（非 local→omitted(not_local)；非 linux→unsupported(platform_unsupported)；linux 经 runDomain）；collectSystem 四平台签名统一 (int,error)，linux 各 /proc 探针逐点容错保持、域恒 success；非 linux stub 防御性 skipPlatform。
+  - rds 域：collectFromRDS 改 (int,error) 经 runDomain；新增 rdsCloudError 按错误串分类（NoCredentialProviders/credentials/AccessDenied/UnauthorizedOperation/AuthFailure/InvalidClientTokenId/SignatureDoesNotMatch→permission_denied(auth_failed)，其余→failed(io_error)）；RDS 指标成功但日志失败不互相吞掉→note 摘要；批量解析错 noteOnce。
+  - azure 域：collectFromAzure 改 (int,error)，失败→failed(io_error)；两域仅 postgres 模式且配置了 ID 才登记。
+  - 脱敏：所有 note/skip 摘要经 sanitize()；grep collector 包 log.Fatal*/os.Exit 零命中，运行时 log.Printf 仅剩 executor.recordFailure 两条规范通道（其余为注释）。
+  - TR-8.1：grep + 走查——collectLogs/rds/azure 失败路径全部经 runDomain 产出 outcome；无裸 log.Print 失败处理。
+  - TR-8.2：`GOOS=linux/windows/freebsd go build ./...` 与 darwin 本机构建全部 exit 0；`go test ./... && go vet ./...` 全绿。
+- **Priority**: medium
+- **Depends On**: Task 4
+- **Description**:
+  - collect.go 中 getLogInfo/collectLogs/getPrefix 与 log.go readLogs/readLogLines*：归为 `logs` 域（cluster 级，受 omit log/not_local/版本门控）；文件未找到/不可读/前缀编译失败→failed（io_error）或 omitted(not_local) 的明确落态，替代当前裸 log.Print；processLogBuf 单文件读取 warning 保留为域内计数（不逐文件 outcome，摘要标注失败文件数），避免条数膨胀。
+  - system_linux.go：collectSystem→`system` 域；doStatFS 静默失败保持容错但摘要可标注（tablespace 级失败不产生 outcome）；darwin/freebsd/windows stub 调度落 unsupported(platform_unsupported)；非 local 落 omitted(not_local)。
+  - aws.go/collectFromRDS→`rds` 域：凭证缺失/API 错误→failed（io_error/auth_failed 视错误类型，无法分类时 io_error），尽力模式保留现行 warning-and-continue；azure.go/collectFromAzure→`azure` 域同理；getPrefix 失败路径与 logs 域一致。
+- **Acceptance Criteria Addressed**: AC-2, AC-4, AC-9（云错误可能含资源信息）
+- **Test Requirements**:
+  - `rule` TR-8.1: 相关文件运行时路径无 log.Fatal*；collectLogs/cloud 失败路径产出 outcome（代码走查 + grep）。
+  - `rule` TR-8.2: 平台 stub（非 linux）编译通过并登记 platform_unsupported（交叉编译检查 `GOOS=darwin/windows go build ./...`）。
+
+## Task 9: CLI 接线（--strict、CollectWithReport、退出码、stderr）
+- **Status**: `completed`
+- **Completion Evidence**:
+  - main.go：新增 `--strict`（BoolVarLong.SetFlag→CollectConfig.Strict）+ usage 文案；parse/help 可见。
+  - main() 改 CollectWithReport：严格模式 status=aborted → 不渲染/不写文件、os.Exit(1)（stderr 仅由执行器输出脱敏摘要）；尽力模式恒渲染部分快照后 os.Exit(report.ExitCode())（必需失败 1、其余 0）；pager 路径 process() 内部已 Close+Wait 后才返回到 os.Exit。
+  - `--input` 回放：Collection=nil 旧文件不显示状态段；带 collection 的新文件展示状态但退出码恒 0（注释固定 replay 语义，避免监控二次误判）。
+  - 用法错误 exit 2、输出 IO log.Fatal exit 1、密码提示语义未动。
+  - TR-9.1：退出码纯函数 ExitCode 由 Task 1 outcome_test.go 覆盖（aborted/required failure=1，optional/无报告=0）；main 接线走查完成；`--strict` 在 --help 输出中。
+  - TR-9.2：与 Task 10/11 联调——nil 无状态段测试 TestCollectionStatusNilRendersNothing/TestCSVNoCollectionRowsForOldSnapshot；新文件状态展示见 TestCollectionStatusFailuresSection。
+- **Priority**: high
+- **Depends On**: Task 3
+- **Description**:
+  - main.go：options 增加 `--strict` 长选项（bool，SetFlag），映射 `CollectConfig.Strict=true`；usage 文本增加说明；校验区无需额外取值校验。
+  - 主流程改用 `CollectWithReport`：尽力模式——无论成败都进入输出渲染，渲染后按 `report.ExitCode()` 以 `os.Exit` 收尾（注意 pager 路径需在进程退出前 flush/等待）；严格模式且 status=aborted/必需失败——不创建/不写输出文件，stderr 已由执行器打印脱敏摘要，退出 1。
+  - `--input` 路径：Collection=nil（旧文件）→ 不渲染状态段、退出码 0；新文件自带 collection→human/CSV 显示状态、退出码按报告（回放场景不重新判定失败退出? 定为：回放仅展示，退出码恒 0，避免监控二次误判；在代码注释与 TR 中固定该语义）。
+  - 保证密码提示/pager/文件创建错误的既有退出语义不变（用法 2、输出 IO 错误 1）。
+- **Acceptance Criteria Addressed**: AC-6, AC-7, AC-10
+- **Test Requirements**:
+  - `rule` TR-9.1: 代码走查 + 构建：`--strict` 出现在 help；尽力模式输出在 required 失败时仍写出且进程返回 1（通过退出码纯函数单测 + main 接线审查；无 DB 环境不做端到端）。
+  - `rule` TR-9.2: `--input` 旧文件退出码 0 且无状态段；新文件展示状态段（与 Task 10/11 联调断言）。
+
+## Task 10: human 输出 Collection Status 段
+- **Status**: `completed`
+- **Completion Evidence**:
+  - report.go：writeHumanTo 三模式分发后统一调 writeCollectionStatus（单一共享实现，非三份拷贝）；nil→零输出；零失败类→单行 `Collection Status: success (N domains)`；有失败→Overall 行（status+policy+域数）、失败域按 domain/target 排序逐条 `domain[(target)]: status (code) — summary`、omitted/unsupported 折叠 `Not collected: X unsupported, Y omitted`。
+  - 文本仅消费 outcome.Summary（collector 侧 sanitize 后的契约字段），渲染层不接触原始错误。
+  - TR-10.1：report_test.go 4 测试（healthy 单行、nil 无段、失败段三态/目标/折叠齐全、trust-boundary 脱敏占位断言）全绿。
+  - TR-10.2 评分：**5/5**——成功仅一行；失败一屏内：1 总体行+失败条目+1 折叠行，噪声受控（skip 域不刷屏）。
+- **Priority**: medium
+- **Depends On**: Task 1
+- **Description**:
+  - report.go：三个渲染器（postgres/pgbouncer/pgpool 共用）在末尾增加 Collection Status 段：首行总体状态（success/degraded/failed/aborted + policy + outcome 计数），随后逐条列出非 success/omitted? 定为列出 status ∈ {timeout,permission_denied,failed} 的域（domain[target]、code、summary），并单列 omitted/unsupported 计数；全部 success 无任何失败类记录时仅一行 `Collection Status: success (N domains)`；`result.Collection == nil`（旧文件）整段不输出。
+  - 文本只能使用已脱敏 summary。
+- **Acceptance Criteria Addressed**: AC-8, AC-9, AC-10
+- **Test Requirements**:
+  - `rule` TR-10.1: 渲染单测（cmd/pgmetrics 包，构造含 outcomes 的 Model）：断言三态行存在、失败条目与输入一致、含密码的 summary 不以明文出现；Collection=nil 时输出不含 "Collection Status"。
+  - `rubric` TR-10.2: 可读性与噪声控制；scale 1-5；1=刷屏或信息缺失；3=可用但冗长；5=一屏内状态清晰、omitted/unsupported 折叠计数；threshold >=4。
+
+## Task 11: CSV 输出 collection 行
+- **Status**: `completed`
+- **Completion Evidence**:
+  - csv.go model2csv 在 meta/顶层字段后显式写出 pgmetrics.collection.{contract_version,policy,status,started_at,ended_at,outcomes.count} 及每条 outcome.<i>.{domain,target(omitempty),status,started_at,ended_at,duration_millis,code,summary,rows}，全部值经 cleanstr；反射路径遇到 *CollectionReport 指针自然跳过，无双写。
+  - TR-11.1：csv_test.go TestCSVCollectionRows 断言五域两失败行键值齐全（含 target/code/summary/时间/duration）；TestCSVCollectionSanitized 全量值扫描无凭证明文；TestCSVNoCollectionRowsForOldSnapshot 断言 Collection=nil 零 collection 行。
+  - TR-11.2：TestHumanCSVDomainCountConsistency 同一 failureReport 在 human（"5 domains"）与 CSV（outcomes.count=5）计数一致；go test/vet 全绿。
+- **Priority**: medium
+- **Depends On**: Task 1
+- **Description**:
+  - csv.go model2csv：当 `m.Collection != nil` 时显式写出（struct2csv 反射对切片不适用）：`pgmetrics.collection.contract_version/policy/status/started_at/ended_at` 与每条 `pgmetrics.collection.outcome.<i>.{domain,target,status,started_at,ended_at,duration_millis,code,summary,rows}`；复用 cleanstr 清洗。
+- **Acceptance Criteria Addressed**: AC-8, AC-9
+- **Test Requirements**:
+  - `rule` TR-11.1: CSV 渲染单测：构造两域 outcome（一失败含密码噪声串），断言对应键行齐全/值一致、密码明文零命中；Collection=nil 时无 collection 行。
+  - `rule` TR-11.2: 与 JSON/human 一致性联调断言（同一 Model 三处域计数相等）。
+
+## Task 12: 全量门禁、兼容性核对与文档级收尾
+- **Status**: `completed`
+- **Completion Evidence**:
+  - 门禁输出（仓库根执行，全部 exit 0）：
+    - `gofmt -l .` → 零输出；
+    - `go build ./...` → 通过；
+    - 交叉编译 `GOOS=darwin/windows/linux/freebsd go build ./...` → 四平台 ok；
+    - `go vet ./...` → 零告警；
+    - `go test ./...` → pgmetrics / collector / cmd/pgmetrics 三包全 ok。
+  - 静态核对：
+    - AC-4：collector 包 `log.Fatal*`/`os.Exit` 零命中（grep）；运行时 stderr 仅 executor.recordFailure 两条与记录同源的规范 warning；
+    - AC-2：catalog 58 域名在 executor.go 外均有调度/门控引用（grep 计数审计，无孤立域）；必需域 12 个与用户批准的核心集逐一相符（postgres 8 + pgbouncer 2 + pgpool 2，connection/current_user 跨模式）；
+    - AC-10：`git diff model.go` 仅 8 insertions/1 deletion——版本注释、ModelSchemaVersion 1.21→1.22、末尾附加 `Collection *CollectionReport json:"collection,omitempty"`，旧键零改动。
+  - 旧夹具：cmd/pgmetrics/compat_test.go 内联 1.21 形态最小 JSON（无 collection 键），TestOldSnapshot121Compatibility 覆盖 JSON 解码→Collection=nil→human 渲染不 panic 且无状态段→CSV 无 pgmetrics.collection 行→再编码保持无 collection 键。
+  - AC 证据映射：AC-1→outcome.go+model.go/Task 1；AC-2→domainCatalog 三方审计/Task 3+12；AC-3→classify 单测/Task 2；AC-4→grep/Task 12；AC-5→runDomain 时间戳与 rows 透传/Task 3-6；AC-6→策略单测与 main 接线/Task 3+9；AC-7→ExitCode 单测+main os.Exit/Task 1+9；AC-8→同一 CollectionReport 驱动 JSON（内嵌）/human（Task 10）/CSV（Task 11）+计数一致性测试；AC-9→sanitize 单测（KV/URI 密码掩码、幂等）+渲染层仅消费 Summary/Task 2+10+11；AC-10→1.21 夹具/本任务；AC-11→标量 rows=1、切片 rows=扫描行数、空切片 success+rows=0/Task 5-7；AC-12→SQL/Scan 零改动 diff 走查/Task 5-7；AC-13→本门禁。
+  - TR-12.1：上述命令输出见本记录；TR-12.2：夹具测试通过、model.go diff 仅附加。
+- **Review 修复闭环（review.md F1-F8，复审前）**：
+  - **F1 [critical] 已修**：`isLockTimeoutError` 由直接类型断言改为 `errors.As(err, &pgerr)`，恢复 55P03 被 `%w` 包装后 tables/indexes 去尺寸列重试路径（[collect.go:1988](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/collect.go#L1988)）；全仓 grep 确认无其他 `.(*pgconn.PgError)` 直接断言；新增 `TestIsLockTimeoutErrorWrapped`（裸/包装 55P03=true、57014/io.EOF/nil=false）。
+  - **F2 [minor] 已修**：getStatRecovery 对 `sql.ErrNoRows`（pg19 standby 无 pg_read_all_stats）返回 (0,nil) 空态 success，其余错误照旧上卷（[collect.go:3966-3982](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/collect.go#L3966-L3982)）。
+  - **F3 [minor] 已修**：CollectWithReport 中 database_list 域失败类终态（任意策略）即 finish，不再落入无名 target 默认采集（[collect.go:275-281](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/collect.go#L275-L281)）。
+  - **F4 [minor] 已修**：recordFailure 严格中止增加 `pgmetrics.IsFailureClass(status)` 条件，unsupported/omitted 等非失败分类不中止（[executor.go:331-339](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/executor.go#L331-L339)）；新增 `TestStrictAbortsOnlyFailureClass`（undefined_object→unsupported 不中止；query_error→errAborted）。
+  - **F5 [minor] 已修**：getCitusVersion 仅在 classify 返回 codeUndefinedObject（42P01/42P02/42883）时落 extension_absent，超时/连接/权限错误正常上卷（[citus.go:52-64](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/citus.go#L52-L64)）。
+  - **F6 [nit] 已修**：local_probe 失败改为 c.note 机制，由 runDomain 统一计时落 success（不再手工 Record duration=0）。
+  - **F7 [nit] 已修**：recordFailure 记录失败 outcome 后删除该 (domain,target) 残留 note。
+  - **F8 [nit] 已修**：getStatIOs 删除不可达的 version<pgv16 else-return 分支（v16/v17 else 注释固化门控不变量）。
+  - 复审门禁（仓库根，全 exit 0）：`gofmt -l .` 零输出；`go build ./...`、`go vet ./...`、`go test ./... -race` 三包 ok；GOOS=darwin/linux/windows/freebsd 交叉编译 ok；两个新增回归测试实测 PASS。
+  - **AC-6 编排层补测与独立复审**：新增 [orchestration_test.go](file:///Users/nancy/swe-project/pgmetrics_fork1/collector/orchestration_test.go)（不存在 unix socket 目录，pgx 拨号即时 ENOENT、零网络依赖，3 测试 12 断言）：TestOrchestrationBestEffortRequiredFailure（尽力模式必需连接失败→部分模型+failed+exit 1、logs 仍落 not_local）、TestOrchestrationStrictRequiredFailureAborts（严格→aborted、logs 门控跳过）、TestOrchestrationDatabaseListFailureStopsRun（--all-dbs 两策略下列库失败即收尾、无无名 target/后续域）。两轮独立代理复审（review.md 第七节及"编排层测试复审"小节）：F1-F8 全 FIXED、AC-12 4/5 PASS、AC-6 PARTIAL→**PASS**，总体 ✅ PASS，13/13 AC 无残留；`go test ./... -race -count=1` 全绿。
+- **Priority**: high
+- **Depends On**: Task 5, Task 6, Task 7, Task 8, Task 9, Task 10, Task 11
+- **Description**:
+  - `gofmt ./...`、`go build ./...`、`GOOS=darwin GOOS=windows GOOS=linux go build ./...`、`go vet ./...`、`go test ./...` 全绿。
+  - 静态核对：collector 包无 log.Fatal*/os.Exit（AC-4）；FR-6/FR-7 域与登记表/调度点三方一致；旧 JSON 键 diff 审查（model.go 仅附加）。
+  - 构造一份 1.21 形态最小 JSON 夹具做 `--input` 兼容单测（解析+human/CSV 渲染不 panic、无状态段）。
+  - 自查全部 AC 证据并回填 tasks.md Completion Evidence。
+- **Acceptance Criteria Addressed**: AC-4, AC-10, AC-13
+- **Test Requirements**:
+  - `rule` TR-12.1: 上述命令全部退出 0，输出粘贴为证据。
+  - `rule` TR-12.2: 旧夹具单测通过；model.go diff 仅含新增字段/常量/注释。

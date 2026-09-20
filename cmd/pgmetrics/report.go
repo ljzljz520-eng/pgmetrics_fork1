@@ -54,6 +54,79 @@ func writeHumanTo(fd io.Writer, o options, result *pgmetrics.Model) {
 	} else {
 		postgresWriteHumanTo(fd, o, result)
 	}
+	writeCollectionStatus(fd, result)
+}
+
+// writeCollectionStatus appends the shared Collection Status section.
+// It renders the single status source (model.Collection) for all three
+// modes. Snapshots produced before the contract (model.Collection == nil)
+// produce no section at all. Only pre-sanitized summaries are printed.
+func writeCollectionStatus(fd io.Writer, result *pgmetrics.Model) {
+	r := result.Collection
+	if r == nil {
+		return
+	}
+
+	counts := r.CountByStatus()
+	n := len(r.Outcomes)
+	nFailed := counts[pgmetrics.CollectionStatusFailed]
+	nTimeout := counts[pgmetrics.CollectionStatusTimeout]
+	nDenied := counts[pgmetrics.CollectionStatusPermissionDenied]
+	nOmitted := counts[pgmetrics.CollectionStatusOmitted]
+	nUnsupported := counts[pgmetrics.CollectionStatusUnsupported]
+	nFailureClass := nFailed + nTimeout + nDenied
+
+	// healthy run: a single line
+	if nFailureClass == 0 {
+		fmt.Fprintf(fd, "\nCollection Status: %s (%d domains)\n", r.Status, n)
+		return
+	}
+
+	fmt.Fprintf(fd, `
+Collection Status:
+    Overall:             %s (policy: %s, %d domains)
+`, r.Status, r.Policy, n)
+
+	// list every failure-class outcome, in a stable order
+	failures := make([]pgmetrics.DomainOutcome, 0, nFailureClass)
+	for _, o := range r.Outcomes {
+		if pgmetrics.IsFailureClass(o.Status) {
+			failures = append(failures, o)
+		}
+	}
+	sort.Slice(failures, func(i, j int) bool {
+		if failures[i].Domain != failures[j].Domain {
+			return failures[i].Domain < failures[j].Domain
+		}
+		return failures[i].Target < failures[j].Target
+	})
+	for _, o := range failures {
+		where := o.Domain
+		if o.Target != "" {
+			where = fmt.Sprintf("%s (target: %s)", o.Domain, o.Target)
+		}
+		code := o.Code
+		if code == "" {
+			code = "unknown"
+		}
+		if o.Summary != "" {
+			fmt.Fprintf(fd, "    %-20s %s (%s) — %s\n", where+":", o.Status, code, o.Summary)
+		} else {
+			fmt.Fprintf(fd, "    %-20s %s (%s)\n", where+":", o.Status, code)
+		}
+	}
+
+	// explicit non-execution outcomes are folded into counts
+	var folded []string
+	if nUnsupported > 0 {
+		folded = append(folded, fmt.Sprintf("%d unsupported", nUnsupported))
+	}
+	if nOmitted > 0 {
+		folded = append(folded, fmt.Sprintf("%d omitted", nOmitted))
+	}
+	if len(folded) > 0 {
+		fmt.Fprintf(fd, "    Not collected:       %s\n", strings.Join(folded, ", "))
+	}
 }
 
 func postgresWriteHumanTo(fd io.Writer, o options, result *pgmetrics.Model) {

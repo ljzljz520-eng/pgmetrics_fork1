@@ -66,6 +66,10 @@ Collection options:
       --only-listed            collect info only from the databases listed as
                                    command-line args (use with Heroku)
       --all-dbs                collect info from all user databases
+      --strict                 stop collection at the first failure of a
+                                   required domain (default: best-effort, a
+                                   partial snapshot is written and the exit
+                                   code reports the outcome)
       --log-file               location of PostgreSQL log file
       --log-dir                read all the PostgreSQL log files in this directory
       --log-span=MINS          examine the last MINS minutes of logs (default: 5)
@@ -221,6 +225,7 @@ func (o *options) parse() (args []string) {
 	s.UintVarLong(&o.CollectConfig.StmtsLimit, "statements-limit", 0, "")
 	s.BoolVarLong(&o.CollectConfig.OnlyListedDBs, "only-listed", 0, "").SetFlag()
 	s.BoolVarLong(&o.CollectConfig.AllDBs, "all-dbs", 0, "").SetFlag()
+	s.BoolVarLong(&o.CollectConfig.Strict, "strict", 0, "").SetFlag()
 	s.StringVarLong(&o.CollectConfig.LogFile, "log-file", 0, "")
 	s.StringVarLong(&o.CollectConfig.LogDir, "log-dir", 0, "")
 	s.UintVarLong(&o.CollectConfig.LogSpan, "log-span", 0, "")
@@ -416,7 +421,12 @@ func main() {
 
 	// collect or load data
 	var result *pgmetrics.Model
+	var report *pgmetrics.CollectionReport
+	exitCode := 0
 	if len(o.input) > 0 {
+		// replay mode: a previously saved snapshot is rendered as-is.
+		// Replay never re-judges failures: the exit code is always 0
+		// (the embedded collection status, if any, is displayed only).
 		f, err := os.Open(o.input)
 		if err != nil {
 			log.Fatal(err)
@@ -428,15 +438,28 @@ func main() {
 		result = &obj
 		f.Close()
 	} else {
-		result = collector.Collect(o.CollectConfig, args)
+		result, report = collector.CollectWithReport(o.CollectConfig, args)
 		// add the user agent
 		if len(version) == 0 {
 			result.Metadata.UserAgent = "pgmetrics/devel"
 		} else {
 			result.Metadata.UserAgent = "pgmetrics/" + version
 		}
+
+		// In strict mode an aborted run must not produce a snapshot:
+		// the executor has already emitted the sanitized failure on
+		// stderr while recording the outcome.
+		if o.CollectConfig.Strict && report != nil &&
+			report.Status == pgmetrics.CollectionOverallAborted {
+			os.Exit(1)
+		}
+
+		// best-effort: always render the (possibly partial) snapshot and
+		// communicate the required-domain outcome via the exit code
+		exitCode = report.ExitCode()
 	}
 
 	// process it
 	process(result, o, args)
+	os.Exit(exitCode)
 }

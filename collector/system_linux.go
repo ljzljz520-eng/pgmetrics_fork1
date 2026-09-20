@@ -27,7 +27,7 @@ import (
 	"github.com/rapidloop/pgmetrics"
 )
 
-func (c *collector) collectSystem(o CollectConfig) {
+func (c *collector) collectSystem(o CollectConfig) (int, error) {
 	c.result.System = &pgmetrics.SystemMetrics{}
 
 	// 1. disk space (bytes free/used/reserved, inodes free/used) for each tablespace
@@ -46,6 +46,9 @@ func (c *collector) collectSystem(o CollectConfig) {
 
 	// 5. hostname
 	c.result.System.Hostname, _ = os.Hostname()
+
+	// individual probes are best-effort and never fail the domain
+	return 1, nil
 }
 
 func (c *collector) doStatFS(t *pgmetrics.Tablespace) {

@@ -19,8 +19,8 @@ package collector
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
-	"log"
 	"math"
 	"os"
 	"os/user"
@@ -85,6 +85,10 @@ type CollectConfig struct {
 	TimeoutSec          uint
 	LockTimeoutMillisec uint
 	NoSizes             bool
+	// Strict aborts the run when a required collection domain fails;
+	// the default (false) is best-effort, where every failure is recorded
+	// in the collection report and the run continues.
+	Strict bool
 
 	// collection
 	Schema          string
@@ -171,13 +175,25 @@ func getRegexp(r string) (rx *regexp.Regexp) {
 // 'dbname' keyword (usually tries to connect to a database with same name
 // as the user).
 //
-// Ideally, this should return (*pgmetrics.Model, error). But for now, it does
-// a log.Fatal(). This will be rectified in the future, and
-// backwards-compatibility will be broken when that happens. You've been warned.
+// This is the backwards-compatible entry point: it always runs in
+// best-effort policy and returns only the model (the collection report is
+// also embedded in model.Collection). Use CollectWithReport to obtain the
+// report separately or to select the strict policy.
 func Collect(o CollectConfig, dbnames []string) *pgmetrics.Model {
+	m, _ := CollectWithReport(o, dbnames)
+	return m
+}
+
+// CollectWithReport performs the metrics collection and returns the model
+// together with its versioned collection report. Under the best-effort
+// policy (default) it records per-domain failures and always returns the
+// (possibly partial) model; under the strict policy it stops after the
+// first required-domain failure, marks the report as aborted and returns
+// whatever was collected up to that point.
+func CollectWithReport(o CollectConfig, dbnames []string) (*pgmetrics.Model, *pgmetrics.CollectionReport) {
 	// form connection string
 	var connstr string
-	mode := "postgres"
+	mode := modePostgres
 	// Support supplying the connection string itself as an argument. If this
 	// is specified, it takes precedence over other command-line options.
 	if len(dbnames) == 1 {
@@ -187,7 +203,7 @@ func Collect(o CollectConfig, dbnames []string) *pgmetrics.Model {
 			// yes it is, use it
 			connstr = cfg.ConnString() + " "
 			if cfg.Database == "pgbouncer" {
-				mode = "pgbouncer"
+				mode = modePgBouncer
 			}
 			dbnames = dbnames[1:]
 		}
@@ -211,15 +227,15 @@ func Collect(o CollectConfig, dbnames []string) *pgmetrics.Model {
 			connstr += makeKV("sslmode", "disable")
 		}
 		if len(dbnames) == 1 && dbnames[0] == "pgbouncer" {
-			mode = "pgbouncer"
+			mode = modePgBouncer
 		}
 	}
 	if o.Pgpool {
-		mode = "pgpool"
+		mode = modePgpool
 	}
 
 	// set timeouts (but not for pgbouncer, it does not like them)
-	if mode != "pgbouncer" {
+	if mode != modePgBouncer {
 		connstr += makeKV("lock_timeout", strconv.Itoa(int(o.LockTimeoutMillisec)))
 		connstr += makeKV("statement_timeout", strconv.Itoa(int(o.TimeoutSec)*1000))
 	}
@@ -235,75 +251,175 @@ func Collect(o CollectConfig, dbnames []string) *pgmetrics.Model {
 		connstr += makeKV("default_query_exec_mode", "simple_protocol")
 	}
 
-	// if "all DBs" was specified, collect the names of databases first
-	if o.AllDBs {
-		dbnames = getDBNames(connstr, o)
-	}
-
-	// collect from 1 or more DBs
 	c := &collector{
 		dbnames: dbnames,
 		mode:    mode,
 	}
-	if len(dbnames) == 0 {
-		collectFromDB(connstr, c, o)
-	} else {
-		for _, dbname := range dbnames {
-			collectFromDB(connstr+makeKV("dbname", dbname), c, o)
+	c.initCollectionReport(o)
+	// stamp metadata early so that failed-connect snapshots have a time
+	c.result.Metadata.At = time.Now().Unix()
+
+	// if "all DBs" was specified, collect the names of databases first
+	if o.AllDBs {
+		if err := c.runDomain(domainDatabaseList, "", func() (int, error) {
+			names, err := getDBNames(connstr, o)
+			if err != nil {
+				return 0, err
+			}
+			dbnames = names
+			c.dbnames = names
+			return len(names), nil
+		}); err != nil {
+			return c.finish()
+		}
+		// if the listing itself failed, collecting a fallback unnamed
+		// target would produce unattributable results; stop regardless
+		// of the policy (the domain outcome explains the run)
+		if od, ok := c.report.Outcome(domainDatabaseList, ""); ok &&
+			pgmetrics.IsFailureClass(od.Status) {
+			return c.finish()
 		}
 	}
-	if !slices.Contains(o.Omit, "log") && c.local {
-		// note: for rds we collect logs in the next step
-		c.collectLogs(o)
+
+	// collect from 1 or more DBs
+	if len(dbnames) == 0 {
+		_ = collectFromDB(connstr, c, o, "")
+	} else {
+		for _, dbname := range dbnames {
+			if c.aborted {
+				break
+			}
+			if err := collectFromDB(connstr+makeKV("dbname", dbname), c, o, dbname); err != nil {
+				if errors.Is(err, errAborted) {
+					break
+				}
+				// errTargetUnreachable: best-effort, continue with next db
+			}
+		}
 	}
 
-	// collect from RDS if database id is specified
-	if len(o.RDSDBIdentifier) > 0 {
-		c.collectFromRDS(o)
+	if !c.aborted && c.mode == modePostgres {
+		// local server log files (RDS logs are part of the rds domain)
+		c.runLogsDomain(o)
+
+		// collect from RDS if database id is specified
+		if len(o.RDSDBIdentifier) > 0 {
+			_ = c.runDomain(domainRDS, "", func() (int, error) {
+				return c.collectFromRDS(o)
+			})
+		}
+
+		// collect from Azure if resource id is specified
+		if len(o.AzureResourceID) > 0 {
+			_ = c.runDomain(domainAzure, "", func() (int, error) {
+				return c.collectFromAzure(o)
+			})
+		}
 	}
 
-	// collect from Azure if resource id is specified
-	if len(o.AzureResourceID) > 0 {
-		c.collectFromAzure(o)
-	}
-
-	return &c.result
+	return c.finish()
 }
 
-func getConn(connstr string, o CollectConfig) *sql.DB {
+// runLogsDomain records the logs-domain outcome for the local-postgres
+// case: an explicit omission for --omit=log, an environment skip when
+// the server is remote, or an executed domain otherwise.
+func (c *collector) runLogsDomain(o CollectConfig) {
+	switch {
+	case slices.Contains(o.Omit, "log"):
+		c.skipOption(domainLogs, "", "log collection disabled by --omit=log")
+	case !c.local:
+		c.skip(domainLogs, "", codeNotLocal,
+			"log collection requires running on the database host (RDS logs are collected by the rds domain)")
+	default:
+		_ = c.runDomain(domainLogs, "", func() (int, error) {
+			return c.collectLogs(o)
+		})
+	}
+}
+
+// finish finalizes the collection report, attaches it to the model and
+// returns both.
+func (c *collector) finish() (*pgmetrics.Model, *pgmetrics.CollectionReport) {
+	if c.report != nil {
+		c.report.EndedAt = time.Now().Unix()
+		if c.aborted {
+			c.report.Status = pgmetrics.CollectionOverallAborted
+		} else {
+			c.report.Status = c.report.Aggregate()
+		}
+		c.result.Collection = c.report
+	}
+	return &c.result, c.report
+}
+
+func getConn(connstr string, o CollectConfig) (*sql.DB, error) {
 	db, err := sql.Open("pgx", connstr)
 	if err != nil {
-		log.Fatalf("failed to open connection: %v", err)
+		return nil, newDomainError(codeConnFailed, err)
 	}
 
 	// ensure only 1 conn
 	db.SetMaxIdleConns(1)
 	db.SetMaxOpenConns(1)
 
+	t := time.Duration(o.TimeoutSec) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), t)
+	defer cancel()
+
+	// verify the connection up-front, so that connect/authentication
+	// failures are attributed to the connection domain instead of every
+	// later query
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	// set role, if specified
 	if len(o.Role) > 0 {
 		if !isValidIdent(o.Role) {
-			log.Fatalf("bad format for role %q", o.Role)
+			db.Close()
+			return nil, newDomainError(codeInternalError, fmt.Errorf("bad format for role %q", o.Role))
 		}
-		t := time.Duration(o.TimeoutSec) * time.Second
-		ctx, cancel := context.WithTimeout(context.Background(), t)
-		defer cancel()
 		if _, err := db.ExecContext(ctx, "SET ROLE "+o.Role); err != nil {
-			log.Fatalf("failed to set role %q: %v", o.Role, err)
+			db.Close()
+			return nil, err
 		}
 	}
 
-	return db
+	return db, nil
 }
 
-func collectFromDB(connstr string, c *collector, o CollectConfig) {
-	db := getConn(connstr, o)
-	c.collect(db, o)
-	db.Close()
+// errTargetUnreachable marks a best-effort per-target connection failure;
+// the run continues with the next database.
+var errTargetUnreachable = errors.New("could not connect to target database")
+
+func collectFromDB(connstr string, c *collector, o CollectConfig, target string) error {
+	c.curTarget = target
+	var db *sql.DB
+	if err := c.runDomain(domainConnection, target, func() (int, error) {
+		d, err := getConn(connstr, o)
+		if err != nil {
+			return 0, err
+		}
+		db = d
+		return 1, nil
+	}); err != nil {
+		return err // errAborted under strict policy
+	}
+	if db == nil {
+		// best-effort: the required connection failure is recorded, skip
+		// every domain for this target and move on
+		return errTargetUnreachable
+	}
+	defer db.Close()
+	return c.collect(db, o)
 }
 
-func getDBNames(connstr string, o CollectConfig) (dbnames []string) {
-	db := getConn(connstr+makeKV("dbname", "postgres"), o)
+func getDBNames(connstr string, o CollectConfig) (dbnames []string, err error) {
+	db, err := getConn(connstr+makeKV("dbname", "postgres"), o)
+	if err != nil {
+		return nil, err
+	}
 	defer db.Close()
 
 	timeout := time.Duration(o.TimeoutSec) * time.Second
@@ -315,21 +431,21 @@ func getDBNames(connstr string, o CollectConfig) (dbnames []string) {
 		   WHERE (NOT datistemplate) AND (datname <> 'postgres')`
 	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_database query failed: %v", err)
+		return nil, fmt.Errorf("pg_database query failed: %w", err)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			log.Fatalf("pg_database query failed: %v", err)
+			return nil, newDomainError(codeScanError, fmt.Errorf("pg_database query failed: %w", err))
 		}
 		dbnames = append(dbnames, name)
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_database query failed: %v", err)
+		return nil, fmt.Errorf("pg_database query failed: %w", err)
 	}
-	return
+	return dbnames, nil
 }
 
 type collector struct {
@@ -347,24 +463,31 @@ type collector struct {
 	sqlLength    uint
 	stmtsLimit   uint
 	dbnames      []string
+	curTarget    string // database name of the current connection ("" if unnamed)
 	curlogfile   string
 	csvlog       bool
 	logSpan      uint
 	currLog      pgmetrics.LogEntry
 	rxPrefix     *regexp.Regexp
-	mode         string // "postgres", "pgbouncer" or "pgpool"
+	mode         string // modePostgres, modePgBouncer or modePgpool
+
+	// unified collection outcome state
+	report  *pgmetrics.CollectionReport
+	strict  bool
+	aborted bool
+	notes   map[string]string // domain\x00target -> success summary note
 }
 
-func (c *collector) collect(db *sql.DB, o CollectConfig) {
+func (c *collector) collect(db *sql.DB, o CollectConfig) error {
 	if !c.beenHere {
-		c.collectFirst(db, o)
+		err := c.collectFirst(db, o)
 		c.beenHere = true
-	} else {
-		c.collectNext(db, o)
+		return err
 	}
+	return c.collectNext(db, o)
 }
 
-func (c *collector) collectFirst(db *sql.DB, o CollectConfig) {
+func (c *collector) collectFirst(db *sql.DB, o CollectConfig) error {
 	c.db = db
 	c.timeout = time.Duration(o.TimeoutSec) * time.Second
 
@@ -387,28 +510,65 @@ func (c *collector) collectFirst(db *sql.DB, o CollectConfig) {
 	// collect either postgres, pgbouncer or pgpool metrics
 	c.result.Metadata.Mode = c.mode
 	switch c.mode {
-	case "pgpool":
-		c.getCurrentUser()
-		c.collectPgpool()
-	case "pgbouncer":
-		c.collectPgBouncer()
-	case "postgres":
-		c.getCurrentUser()
-		c.collectPostgres(o)
+	case modePgpool:
+		if err := c.runDomain(domainCurrentUser, "", func() (int, error) {
+			return 1, c.getCurrentUser()
+		}); err != nil {
+			return err
+		}
+		if err := c.collectPgpool(); err != nil {
+			return err
+		}
+	case modePgBouncer:
+		if err := c.collectPgBouncer(); err != nil {
+			return err
+		}
+	case modePostgres:
+		if err := c.runDomain(domainCurrentUser, "", func() (int, error) {
+			return 1, c.getCurrentUser()
+		}); err != nil {
+			return err
+		}
+		if err := c.collectPostgres(o); err != nil {
+			return err
+		}
 	default:
-		log.Fatalf("unknown mode %q", c.mode)
+		return c.runFatal("init", "", true, newDomainError(codeInternalError,
+			fmt.Errorf("unknown mode %q", c.mode)))
 	}
+	return nil
 }
 
-func (c *collector) collectPostgres(o CollectConfig) {
-	// get settings and other configuration
-	c.getSettings()
-	if v, err := strconv.Atoi(c.setting("server_version_num")); err != nil {
-		log.Fatalf("bad server_version_num: %v", err)
-	} else {
+func (c *collector) collectPostgres(o CollectConfig) error {
+	// get settings and other configuration; the server version is parsed
+	// inside the settings domain so that a bad value fails that domain.
+	if err := c.runDomain(domainSettings, "", func() (int, error) {
+		n, err := c.getSettings()
+		if err != nil {
+			return n, err
+		}
+		v, err := strconv.Atoi(c.setting("server_version_num"))
+		if err != nil {
+			return n, newDomainError(codeQueryError,
+				fmt.Errorf("bad server_version_num: %w", err))
+		}
 		c.version = v
+		return n, nil
+	}); err != nil {
+		return err
 	}
-	c.getLocal()
+
+	// locality probe: a probe error stays a successful domain (with a
+	// sanitized note) because locality is only used to enable extra
+	// local-only domains.
+	if err := c.runDomain(domainLocalProbe, "", func() (int, error) {
+		if err := c.getLocal(); err != nil {
+			c.note(domainLocalProbe, "", sanitize(err.Error()))
+		}
+		return 1, nil
+	}); err != nil {
+		return err
+	}
 	if c.local {
 		c.dataDir = c.setting("data_directory")
 		if len(c.dataDir) == 0 {
@@ -416,206 +576,349 @@ func (c *collector) collectPostgres(o CollectConfig) {
 		}
 	}
 
-	c.collectCluster(o)
-	if c.local {
-		// Only implemented for Linux for now.
-		if runtime.GOOS == "linux" {
-			c.collectSystem(o)
+	if err := c.collectCluster(o); err != nil {
+		return err
+	}
+	// system metrics are probed from the local host on Linux only
+	switch {
+	case !c.local:
+		c.skip(domainSystem, "", codeNotLocal,
+			"system metrics collection requires running on the database host")
+	case runtime.GOOS != "linux":
+		c.skipPlatform(domainSystem, "",
+			"system metrics collection is supported on Linux only")
+	default:
+		if err := c.runDomain(domainSystem, "", func() (int, error) {
+			return c.collectSystem(o)
+		}); err != nil {
+			return err
 		}
 	}
-	c.collectDatabase(o)
+	return c.collectDatabase(o)
 }
 
-func (c *collector) collectNext(db *sql.DB, o CollectConfig) {
+func (c *collector) collectNext(db *sql.DB, o CollectConfig) error {
 	c.db = db
-	c.collectDatabase(o)
+	return c.collectDatabase(o)
 }
 
 // cluster-level info and stats
-func (c *collector) collectCluster(o CollectConfig) {
-	c.getPGSystemInfo()
-
-	if c.version >= pgv96 {
-		c.getControlSystemv96()
+func (c *collector) collectCluster(o CollectConfig) error {
+	if err := c.runDomain(domainSystemInfo, "", c.getPGSystemInfo); err != nil {
+		return err
 	}
 
-	if c.version >= pgv95 {
-		c.getLastXactv95()
+	if err := c.runVersioned(domainControlSystem, "9.6", pgv96, c.getControlSystemv96); err != nil {
+		return err
 	}
 
-	if c.version >= pgv11 {
-		c.getControlCheckpointv11()
-	} else if c.version >= pgv10 {
-		c.getControlCheckpointv10()
-	} else if c.version >= pgv96 {
-		c.getControlCheckpointv96()
+	if err := c.runVersioned(domainLastXact, "9.5", pgv95, c.getLastXactv95); err != nil {
+		return err
 	}
 
-	if c.version >= pgv96 {
-		c.getActivityv96()
-	} else if c.version >= pgv94 {
-		c.getActivityv94()
-	} else {
-		c.getActivityv93()
+	getCheckpoint := func() (int, error) {
+		switch {
+		case c.version >= pgv11:
+			return c.getControlCheckpointv11()
+		case c.version >= pgv10:
+			return c.getControlCheckpointv10()
+		default:
+			return c.getControlCheckpointv96()
+		}
+	}
+	if err := c.runVersioned(domainControlCheckpoint, "9.6", pgv96, getCheckpoint); err != nil {
+		return err
 	}
 
-	if c.version >= pgv10 {
-		c.getBETypeCountsv10()
+	getActivity := func() (int, error) {
+		switch {
+		case c.version >= pgv96:
+			return c.getActivityv96()
+		case c.version >= pgv94:
+			return c.getActivityv94()
+		default:
+			return c.getActivityv93()
+		}
+	}
+	if err := c.runDomain(domainActivity, "", getActivity); err != nil {
+		return err
 	}
 
-	if c.version >= pgv94 {
-		c.getWALArchiver()
+	if err := c.runVersioned(domainBackendTypeCounts, "10", pgv10, c.getBETypeCountsv10); err != nil {
+		return err
 	}
 
-	if c.version >= pgv17 {
-		c.getBGWriterv17()
-	} else {
-		c.getBGWriter()
+	if err := c.runVersioned(domainWALArchiver, "9.4", pgv94, c.getWALArchiver); err != nil {
+		return err
 	}
 
-	if c.version >= pgv10 {
-		c.getReplicationv10()
-	} else {
-		c.getReplicationv9()
+	getBGWriter := func() (int, error) {
+		if c.version >= pgv17 {
+			return c.getBGWriterv17()
+		}
+		return c.getBGWriter()
+	}
+	if err := c.runDomain(domainBGWriter, "", getBGWriter); err != nil {
+		return err
 	}
 
-	if c.version >= pgv13 {
-		c.getWalReceiverv13()
-	} else if c.version >= pgv96 {
-		c.getWalReceiverv96()
+	getReplication := func() (int, error) {
+		if c.version >= pgv10 {
+			return c.getReplicationv10()
+		}
+		return c.getReplicationv9()
+	}
+	if err := c.runDomain(domainReplicationOut, "", getReplication); err != nil {
+		return err
 	}
 
-	if c.version >= pgv10 {
-		c.getAdminFuncv10()
-	} else {
-		c.getAdminFuncv9()
+	getWalReceiver := func() (int, error) {
+		// Aurora does not support pg_stat_get_wal_receiver()
+		if c.isAWSAurora() {
+			c.skip(domainReplicationIn, "", codeAuroraUnsupported,
+				"pg_stat_get_wal_receiver() is not supported on Aurora")
+			return 0, nil
+		}
+		if c.version >= pgv13 {
+			return c.getWalReceiverv13()
+		}
+		return c.getWalReceiverv96()
+	}
+	if err := c.runVersioned(domainReplicationIn, "9.6", pgv96, getWalReceiver); err != nil {
+		return err
 	}
 
-	if c.version >= pgv17 {
-		c.getVacuumProgressv17()
-	} else if c.version >= pgv96 {
-		c.getVacuumProgressv96()
+	getRecovery := func() (int, error) {
+		if c.version >= pgv10 {
+			return c.getAdminFuncv10()
+		}
+		return c.getAdminFuncv9()
+	}
+	if err := c.runDomain(domainRecovery, "", getRecovery); err != nil {
+		return err
 	}
 
-	c.getDatabases(!o.NoSizes, o.OnlyListedDBs, c.dbnames)
-	c.getTablespaces(!o.NoSizes)
-
-	if c.version >= pgv94 {
-		c.getReplicationSlotsv94()
+	getVacuumProgress := func() (int, error) {
+		if c.version >= pgv17 {
+			return c.getVacuumProgressv17()
+		}
+		return c.getVacuumProgressv96()
+	}
+	if err := c.runVersioned(domainVacuumProgress, "9.6", pgv96, getVacuumProgress); err != nil {
+		return err
 	}
 
-	c.getRoles()
-
-	if c.version >= pgv12 {
-		c.getWALCountsv12()
-	} else if c.version >= pgv11 {
-		c.getWALCountsv11()
-	} else {
-		c.getWALCounts()
+	if err := c.runDomain(domainDatabases, "", func() (int, error) {
+		return c.getDatabases(!o.NoSizes, o.OnlyListedDBs, c.dbnames)
+	}); err != nil {
+		return err
+	}
+	if err := c.runDomain(domainTablespaces, "", func() (int, error) {
+		return c.getTablespaces(!o.NoSizes)
+	}); err != nil {
+		return err
 	}
 
-	if c.version >= pgv96 {
-		c.getNotification()
+	if err := c.runVersioned(domainReplicationSlots, "9.4", pgv94, c.getReplicationSlotsv94); err != nil {
+		return err
 	}
 
-	c.getLocks()
+	if err := c.runDomain(domainRoles, "", c.getRoles); err != nil {
+		return err
+	}
 
-	if c.version >= pgv18 {
-		c.getWALv18()
-	} else if c.version >= pgv14 {
-		c.getWAL()
+	getWALCounts := func() (int, error) {
+		switch {
+		case c.version >= pgv12:
+			return c.getWALCountsv12()
+		case c.version >= pgv11:
+			return c.getWALCountsv11()
+		default:
+			return c.getWALCounts()
+		}
+	}
+	if err := c.runDomain(domainWALCounts, "", getWALCounts); err != nil {
+		return err
+	}
+
+	if err := c.runVersioned(domainNotification, "9.6", pgv96, c.getNotification); err != nil {
+		return err
+	}
+
+	if err := c.runDomain(domainLocks, "", c.getLocks); err != nil {
+		return err
+	}
+
+	getWAL := func() (int, error) {
+		if c.version >= pgv18 {
+			return c.getWALv18()
+		}
+		return c.getWAL()
+	}
+	if err := c.runVersioned(domainWAL, "14", pgv14, getWAL); err != nil {
+		return err
 	}
 
 	// various pg_stat_progress_* views
-	if c.version >= pgv12 {
-		c.getProgressCluster()
-		c.getProgressCreateIndex()
+	if err := c.runVersioned(domainProgressCluster, "12", pgv12, c.getProgressCluster); err != nil {
+		return err
 	}
-	if c.version >= pgv13 {
-		c.getProgressAnalyze()
-		c.getProgressBasebackup()
+	if err := c.runVersioned(domainProgressCreateIdx, "12", pgv12, c.getProgressCreateIndex); err != nil {
+		return err
 	}
-	if c.version >= pgv14 {
-		c.getProgressCopy()
+	if err := c.runVersioned(domainProgressAnalyze, "13", pgv13, c.getProgressAnalyze); err != nil {
+		return err
 	}
-	if c.version >= pgv19 {
-		c.getProgressRepack()
+	if err := c.runVersioned(domainProgressBasebackup, "13", pgv13, c.getProgressBasebackup); err != nil {
+		return err
 	}
-
-	if c.version >= pgv17 {
-		c.getCheckpointer()
+	if err := c.runVersioned(domainProgressCopy, "14", pgv14, c.getProgressCopy); err != nil {
+		return err
 	}
-
-	if c.version >= pgv16 {
-		c.getStatIOs()
+	if err := c.runVersioned(domainProgressRepack, "19", pgv19, c.getProgressRepack); err != nil {
+		return err
 	}
 
-	if c.version >= pgv19 {
-		c.getStatLocks()
+	if err := c.runVersioned(domainCheckpointer, "17", pgv17, c.getCheckpointer); err != nil {
+		return err
+	}
+
+	if err := c.runVersioned(domainStatIO, "16", pgv16, c.getStatIOs); err != nil {
+		return err
+	}
+
+	if err := c.runVersioned(domainStatLocks, "19", pgv19, c.getStatLocks); err != nil {
+		return err
 	}
 
 	// pg_stat_recovery has rows only while the server is in recovery
-	if c.version >= pgv19 && c.result.IsInRecovery {
-		c.getStatRecovery()
+	if c.version >= pgv19 {
+		if c.result.IsInRecovery {
+			if err := c.runDomain(domainStatRecovery, "", c.getStatRecovery); err != nil {
+				return err
+			}
+		} else {
+			c.skip(domainStatRecovery, "", codeFeatureDisabled, "server is not in recovery")
+		}
+	} else {
+		c.skipVersion(domainStatRecovery, "", "requires PostgreSQL 19 or later")
 	}
 
 	if !slices.Contains(o.Omit, "log") && c.local {
 		c.getLogInfo()
 	}
+
+	return nil
 }
 
 // info and stats for the current database
-func (c *collector) collectDatabase(o CollectConfig) {
-	currdb := c.getCurrentDatabase()
+func (c *collector) collectDatabase(o CollectConfig) error {
+	var currdb string
+	if err := c.runDomain(domainCurrentDatabase, c.curTarget, func() (int, error) {
+		name, err := c.getCurrentDatabase()
+		if err != nil {
+			return 0, err
+		}
+		currdb = name
+		return 1, nil
+	}); err != nil {
+		return err
+	}
+	// under best-effort a failed current_database domain means we cannot
+	// safely attribute any database-scoped result, skip the rest of them
+	if od, ok := c.report.Outcome(domainCurrentDatabase, c.curTarget); ok &&
+		pgmetrics.IsFailureClass(od.Status) {
+		return nil
+	}
 	if slices.Contains(c.result.Metadata.CollectedDBs, currdb) {
-		return // don't collect from same db twice
+		return nil // don't collect from same db twice
 	}
 	c.result.Metadata.CollectedDBs = append(c.result.Metadata.CollectedDBs, currdb)
 
-	if !slices.Contains(o.Omit, "tables") {
-		c.getTables(!o.NoSizes)
-		// partition information, added schema v1.2
-		if c.version >= pgv10 {
-			c.getPartitionInfo()
-		}
-		// parent information, added schema v1.2
-		c.getParentInfo()
+	omitTables := slices.Contains(o.Omit, "tables")
+
+	// tables domain includes partition (v10+) and parent information as
+	// intra-domain steps
+	if err := c.runDBOption(domainTables, "disabled via --omit=tables", omitTables,
+		func() (int, error) {
+			n, err := c.getTables(!o.NoSizes)
+			if err != nil {
+				return n, err
+			}
+			if c.version >= pgv10 {
+				pn, err := c.getPartitionInfo()
+				if err != nil {
+					return n, err
+				}
+				n += pn
+			}
+			pn, err := c.getParentInfo()
+			if err != nil {
+				return n, err
+			}
+			return n + pn, nil
+		}); err != nil {
+		return err
 	}
-	if !slices.Contains(o.Omit, "tables") && !slices.Contains(o.Omit, "indexes") {
-		c.getIndexes(!o.NoSizes)
-		if !slices.Contains(o.Omit, "indexdefs") {
-			c.getIndexDef()
-		}
+
+	indexesDisabled := omitTables || slices.Contains(o.Omit, "indexes")
+	if err := c.runDBOption(domainIndexes, "disabled via --omit=tables/indexes",
+		indexesDisabled, func() (int, error) {
+			return c.getIndexes(!o.NoSizes)
+		}); err != nil {
+		return err
 	}
-	if !slices.Contains(o.Omit, "sequences") {
-		c.getSequences()
+	indexDefsDisabled := indexesDisabled || slices.Contains(o.Omit, "indexdefs")
+	if err := c.runDBOption(domainIndexDefs, "disabled via --omit=indexdefs",
+		indexDefsDisabled, c.getIndexDef); err != nil {
+		return err
 	}
-	if !slices.Contains(o.Omit, "functions") {
-		c.getUserFunctions()
+
+	if err := c.runDBOption(domainSequences, "disabled via --omit=sequences",
+		slices.Contains(o.Omit, "sequences"), c.getSequences); err != nil {
+		return err
 	}
-	if !slices.Contains(o.Omit, "extensions") {
-		c.getExtensions()
+	if err := c.runDBOption(domainFunctions, "disabled via --omit=functions",
+		slices.Contains(o.Omit, "functions"), c.getUserFunctions); err != nil {
+		return err
 	}
-	if !slices.Contains(o.Omit, "tables") && !slices.Contains(o.Omit, "triggers") {
-		c.getDisabledTriggers()
+	if err := c.runDBOption(domainExtensions, "disabled via --omit=extensions",
+		slices.Contains(o.Omit, "extensions"), c.getExtensions); err != nil {
+		return err
 	}
-	if !slices.Contains(o.Omit, "statements") {
-		c.getStatements(currdb)
+	if err := c.runDBOption(domainTriggers, "disabled via --omit=triggers",
+		omitTables || slices.Contains(o.Omit, "triggers"), c.getDisabledTriggers); err != nil {
+		return err
 	}
-	if !slices.Contains(o.Omit, "bloat") {
-		c.getBloat()
+	if err := c.runDBOption(domainStatements, "disabled via --omit=statements",
+		slices.Contains(o.Omit, "statements"), func() (int, error) {
+			return c.getStatements(currdb)
+		}); err != nil {
+		return err
+	}
+	if err := c.runDBOption(domainBloat, "disabled via --omit=bloat",
+		slices.Contains(o.Omit, "bloat"), c.getBloat); err != nil {
+		return err
 	}
 
 	// logical replication, added schema v1.2
-	if c.version >= pgv10 {
-		c.getPublications()
-		c.getSubscriptions()
+	if err := c.runDBVersioned(domainPublications, "10", pgv10, c.getPublications); err != nil {
+		return err
+	}
+	if err := c.runDBVersioned(domainSubscriptions, "10", pgv10, c.getSubscriptions); err != nil {
+		return err
 	}
 
-	// citus, added in schema 1.9
-	if !slices.Contains(o.Omit, "citus") {
-		c.getCitus(currdb, !o.NoSizes)
+	// citus, added in schema 1.9 (the domain self-skips when the
+	// extension is absent)
+	if err := c.runDBOption(domainCitus, "disabled via --omit=citus",
+		slices.Contains(o.Omit, "citus"), func() (int, error) {
+			return c.getCitus(currdb, !o.NoSizes)
+		}); err != nil {
+		return err
 	}
+
+	return nil
 }
 
 // schemaOK checks to see if this schema is OK to be collected, based on the
@@ -663,14 +966,15 @@ func (c *collector) tableOK(schema, table string) bool {
 	return true
 }
 
-func (c *collector) getCurrentUser() {
+func (c *collector) getCurrentUser() error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT current_user`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.Metadata.Username); err != nil {
-		log.Fatalf("current_user failed: %v", err)
+		return fmt.Errorf("current_user failed: %w", err)
 	}
+	return nil
 }
 
 func (c *collector) setting(key string) string {
@@ -680,7 +984,7 @@ func (c *collector) setting(key string) string {
 	return ""
 }
 
-func (c *collector) getSettings() {
+func (c *collector) getSettings() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -695,16 +999,17 @@ func (c *collector) getSettings() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_settings query failed: %v", err)
+		return 0, fmt.Errorf("pg_settings query failed: %w", err)
 	}
 	defer rows.Close()
 
 	c.result.Settings = make(map[string]pgmetrics.Setting)
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Setting
 		var name, sf, sl string
 		if err := rows.Scan(&name, &s.Setting, &s.BootVal, &s.Source, &sf, &sl, &s.Pending); err != nil {
-			log.Fatalf("pg_settings query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_settings query failed: %w", err))
 		}
 		if len(sf) > 0 {
 			s.Source = sf
@@ -717,13 +1022,15 @@ func (c *collector) getSettings() {
 			s.Source = ""  // will be omitted from json
 		}
 		c.result.Settings[name] = s
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_settings query failed: %v", err)
+		return n, fmt.Errorf("pg_settings query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getWALArchiver() {
+func (c *collector) getWALArchiver() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -739,12 +1046,15 @@ func (c *collector) getWALArchiver() {
 	if err := c.db.QueryRowContext(ctx, q).Scan(&a.ArchivedCount, &a.LastArchivedWAL,
 		&a.LastArchivedTime, &a.FailedCount, &a.LastFailedWAL, &a.LastFailedTime,
 		&a.StatsReset); err != nil {
-		log.Fatalf("pg_stat_archiver query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_archiver query failed: %w", err)
 	}
+	return 1, nil
 }
 
 // have we connected to a postgres server running on the local machine?
-func (c *collector) getLocal() {
+// A probe error is returned (and tolerated by the local_probe domain),
+// it never aborts the run.
+func (c *collector) getLocal() error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -752,12 +1062,15 @@ func (c *collector) getLocal() {
 	q := `SELECT COALESCE(inet_client_addr() = inet_server_addr(), TRUE)
 			OR (inet_server_addr() << '127.0.0.0/8' AND inet_client_addr() << '127.0.0.0/8')`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.local); err != nil {
-		c.local = false // don't fail on errors
+		c.local = false
+		c.result.Metadata.Local = false
+		return fmt.Errorf("locality probe failed: %w", err)
 	}
 	c.result.Metadata.Local = c.local
+	return nil
 }
 
-func (c *collector) getBGWriterv17() {
+func (c *collector) getBGWriterv17() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -767,13 +1080,13 @@ func (c *collector) getBGWriterv17() {
 	var statsReset time.Time
 	if err := c.db.QueryRowContext(ctx, q).Scan(&bg.BuffersClean,
 		&bg.MaxWrittenClean, &bg.BuffersAlloc, &statsReset); err != nil {
-		log.Fatalf("pg_stat_bgwriter query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_bgwriter query failed: %w", err)
 	}
 	bg.StatsReset = statsReset.Unix()
+	return 1, nil
 }
 
-func (c *collector) getBGWriter() {
+func (c *collector) getBGWriter() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -787,13 +1100,13 @@ func (c *collector) getBGWriter() {
 		&bg.CheckpointWriteTime, &bg.CheckpointSyncTime, &bg.BuffersCheckpoint,
 		&bg.BuffersClean, &bg.MaxWrittenClean, &bg.BuffersBackend,
 		&bg.BuffersBackendFsync, &bg.BuffersAlloc, &statsReset); err != nil {
-		log.Fatalf("pg_stat_bgwriter query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_bgwriter query failed: %w", err)
 	}
 	bg.StatsReset = statsReset.Unix()
+	return 1, nil
 }
 
-func (c *collector) getReplicationv10() {
+func (c *collector) getReplicationv10() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -822,11 +1135,11 @@ func (c *collector) getReplicationv10() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_replication query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_replication query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.ReplicationOut
 		var backendXmin sql.NullInt64
@@ -834,17 +1147,19 @@ func (c *collector) getReplicationv10() {
 			&r.BackendStart, &backendXmin, &r.State, &r.SentLSN, &r.WriteLSN,
 			&r.FlushLSN, &r.ReplayLSN, &r.WriteLag, &r.FlushLag, &r.ReplayLag,
 			&r.SyncPriority, &r.SyncState, &r.ReplyTime, &r.PID); err != nil {
-			log.Fatalf("pg_stat_replication query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_replication query failed: %w", err))
 		}
 		r.BackendXmin = int(backendXmin.Int64)
 		c.result.ReplicationOutgoing = append(c.result.ReplicationOutgoing, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_replication query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_replication query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getReplicationv9() {
+func (c *collector) getReplicationv9() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -866,34 +1181,30 @@ func (c *collector) getReplicationv9() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_replication query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_replication query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.ReplicationOut
 		var backendXmin sql.NullInt64
 		if err := rows.Scan(&r.RoleName, &r.ApplicationName, &r.ClientAddr,
 			&r.BackendStart, &backendXmin, &r.State, &r.SentLSN, &r.WriteLSN,
 			&r.FlushLSN, &r.ReplayLSN, &r.SyncPriority, &r.SyncState, &r.PID); err != nil {
-			log.Fatalf("pg_stat_replication query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_replication query failed: %w", err))
 		}
 		r.BackendXmin = int(backendXmin.Int64)
 		c.result.ReplicationOutgoing = append(c.result.ReplicationOutgoing, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_replication query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_replication query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getWalReceiverv13() {
-	// skip if Aurora, because the function errors out with:
-	// "Function pg_stat_get_wal_receiver() is currently not supported in Aurora"
-	if c.isAWSAurora() {
-		return
-	}
-
+func (c *collector) getWalReceiverv13() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -916,11 +1227,10 @@ func (c *collector) getWalReceiverv13() {
 		&r.ReceiveStartTLI, &r.WrittenLSN, &r.FlushedLSN, &r.ReceivedTLI,
 		&msgSend, &msgRecv, &r.LatestEndLSN, &r.LatestEndTime, &r.SlotName,
 		&r.Conninfo, &r.SenderHost); err != nil {
-		if err == sql.ErrNoRows {
-			return // not an error
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil // not an error
 		}
-		log.Printf("warning: pg_stat_wal_receiver query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_wal_receiver query failed: %w", err)
 	}
 
 	if msgSend.Valid && msgRecv.Valid && msgRecv.Time.After(msgSend.Time) {
@@ -933,15 +1243,10 @@ func (c *collector) getWalReceiverv13() {
 		r.LastMsgReceiptTime = msgRecv.Time.Unix()
 	}
 	c.result.ReplicationIncoming = &r
+	return 1, nil
 }
 
-func (c *collector) getWalReceiverv96() {
-	// skip if Aurora, because the function errors out with:
-	// "Function pg_stat_get_wal_receiver() is currently not supported in Aurora"
-	if c.isAWSAurora() {
-		return
-	}
-
+func (c *collector) getWalReceiverv96() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -957,11 +1262,10 @@ func (c *collector) getWalReceiverv96() {
 	if err := c.db.QueryRowContext(ctx, q).Scan(&r.Status, &r.ReceiveStartLSN, &r.ReceiveStartTLI,
 		&r.ReceivedLSN, &r.ReceivedTLI, &msgSend, &msgRecv,
 		&r.LatestEndLSN, &r.LatestEndTime, &r.SlotName, &r.Conninfo); err != nil {
-		if err == sql.ErrNoRows {
-			return // not an error
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil // not an error
 		}
-		log.Printf("warning: pg_stat_wal_receiver query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_wal_receiver query failed: %w", err)
 	}
 
 	if msgSend.Valid && msgRecv.Valid && msgRecv.Time.After(msgSend.Time) {
@@ -974,9 +1278,10 @@ func (c *collector) getWalReceiverv96() {
 		r.LastMsgReceiptTime = msgRecv.Time.Unix()
 	}
 	c.result.ReplicationIncoming = &r
+	return 1, nil
 }
 
-func (c *collector) getAdminFuncv9() {
+func (c *collector) getAdminFuncv9() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -990,15 +1295,14 @@ func (c *collector) getAdminFuncv9() {
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.IsInRecovery,
 		&c.result.LastWALReceiveLSN, &c.result.LastWALReplayLSN,
 		&c.result.LastXActReplayTimestamp); err != nil {
-		log.Printf("warning: admin functions query failed: %v", err)
-		// don't return here, continue with the rest
+		return 0, fmt.Errorf("admin functions query failed: %w", err)
 	}
 
 	if c.result.IsInRecovery {
 		if !c.isAWSAurora() {
 			qr := `SELECT pg_is_xlog_replay_paused()`
 			if err := c.db.QueryRowContext(ctx, qr).Scan(&c.result.IsWalReplayPaused); err != nil {
-				log.Fatalf("pg_is_xlog_replay_paused() failed: %v", err)
+				return 0, fmt.Errorf("pg_is_xlog_replay_paused() failed: %w", err)
 			}
 		}
 	} else {
@@ -1007,14 +1311,15 @@ func (c *collector) getAdminFuncv9() {
 					pg_current_xlog_insert_location(), pg_current_xlog_location()`
 			if err := c.db.QueryRowContext(ctx, qx).Scan(&c.result.WALFlushLSN,
 				&c.result.WALInsertLSN, &c.result.WALLSN); err != nil {
-				log.Fatalf("error querying wal location functions: %v", err)
+				return 0, fmt.Errorf("error querying wal location functions: %w", err)
 			}
 		}
 		// pg_current_xlog_* not available in < v9.6
 	}
+	return 1, nil
 }
 
-func (c *collector) getAdminFuncv10() {
+func (c *collector) getAdminFuncv10() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1028,15 +1333,14 @@ func (c *collector) getAdminFuncv10() {
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.IsInRecovery,
 		&c.result.LastWALReceiveLSN, &c.result.LastWALReplayLSN,
 		&c.result.LastXActReplayTimestamp); err != nil {
-		log.Printf("warning: admin functions query failed: %v", err)
-		// don't return here, continue with the rest
+		return 0, fmt.Errorf("admin functions query failed: %w", err)
 	}
 
 	if c.result.IsInRecovery {
 		if !c.isAWSAurora() {
 			qr := `SELECT pg_is_wal_replay_paused()`
 			if err := c.db.QueryRowContext(ctx, qr).Scan(&c.result.IsWalReplayPaused); err != nil {
-				log.Fatalf("pg_is_wal_replay_paused() failed: %v", err)
+				return 0, fmt.Errorf("pg_is_wal_replay_paused() failed: %w", err)
 			}
 		}
 	} else {
@@ -1045,10 +1349,11 @@ func (c *collector) getAdminFuncv10() {
 				pg_current_wal_insert_lsn(), pg_current_wal_lsn()`
 			if err := c.db.QueryRowContext(ctx, qx).Scan(&c.result.WALFlushLSN,
 				&c.result.WALInsertLSN, &c.result.WALLSN); err != nil {
-				log.Fatalf("error querying wal location functions: %v", err)
+				return 0, fmt.Errorf("error querying wal location functions: %w", err)
 			}
 		}
 	}
+	return 1, nil
 }
 
 func (c *collector) fillTablespaceSize(t *pgmetrics.Tablespace) {
@@ -1071,10 +1376,12 @@ func (c *collector) fillDatabaseSize(d *pgmetrics.Database) {
 	}
 }
 
-func (c *collector) getLastXactv95() {
+func (c *collector) getLastXactv95() (int, error) {
 	// available only if "track_commit_timestamp" is set to "on"
 	if c.setting("track_commit_timestamp") != "on" {
-		return
+		c.skip(domainLastXact, "", codeFeatureDisabled,
+			"track_commit_timestamp is not enabled")
+		return 0, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
@@ -1083,11 +1390,12 @@ func (c *collector) getLastXactv95() {
 	q := `SELECT xid, COALESCE(EXTRACT(EPOCH FROM timestamp)::bigint, 0)
 			FROM pg_last_committed_xact()`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.LastXactXid, &c.result.LastXactTimestamp); err != nil {
-		log.Printf("warning: pg_last_committed_xact() failed: %v", err) // continue anyway
+		return 0, fmt.Errorf("pg_last_committed_xact() failed: %w", err)
 	}
+	return 1, nil
 }
 
-func (c *collector) getPGSystemInfo() {
+func (c *collector) getPGSystemInfo() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1102,21 +1410,23 @@ func (c *collector) getPGSystemInfo() {
 		&c.result.StartTime,
 		&c.result.ConfLoadTime,
 		&c.result.ConnectionTuple); err != nil {
-		log.Fatalf("system functions query failed: %v", err)
+		return 0, fmt.Errorf("system functions query failed: %w", err)
 	}
+	return 1, nil
 }
 
-func (c *collector) getControlSystemv96() {
+func (c *collector) getControlSystemv96() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT system_identifier FROM pg_control_system()`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.SystemIdentifier); err != nil {
-		log.Fatalf("pg_control_system() failed: %v", err)
+		return 0, fmt.Errorf("pg_control_system() failed: %w", err)
 	}
+	return 1, nil
 }
 
-func (c *collector) getControlCheckpointv96() {
+func (c *collector) getControlCheckpointv96() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1129,22 +1439,23 @@ func (c *collector) getControlCheckpointv96() {
 		&c.result.PriorLSN, &c.result.RedoLSN, &c.result.TimelineID, &nextXid,
 		&c.result.OldestXid, &c.result.OldestActiveXid,
 		&c.result.CheckpointTime); err != nil {
-		log.Fatalf("pg_control_checkpoint() failed: %v", err)
+		return 0, fmt.Errorf("pg_control_checkpoint() failed: %w", err)
 	}
 
 	if pos := strings.IndexByte(nextXid, ':'); pos > -1 {
 		nextXid = nextXid[pos+1:]
 	}
 	if v, err := strconv.Atoi(nextXid); err != nil {
-		log.Fatal("bad xid in pg_control_checkpoint()).next_xid")
+		return 0, newDomainError(codeInternalError, errors.New("bad xid in pg_control_checkpoint().next_xid"))
 	} else {
 		c.result.NextXid = v
 	}
 
 	c.fixAuroraCheckpoint()
+	return 1, nil
 }
 
-func (c *collector) getControlCheckpointv10() {
+func (c *collector) getControlCheckpointv10() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1156,22 +1467,23 @@ func (c *collector) getControlCheckpointv10() {
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.CheckpointLSN, &c.result.PriorLSN,
 		&c.result.RedoLSN, &c.result.TimelineID, &nextXid, &c.result.OldestXid,
 		&c.result.OldestActiveXid, &c.result.CheckpointTime); err != nil {
-		log.Fatalf("pg_control_checkpoint() failed: %v", err)
+		return 0, fmt.Errorf("pg_control_checkpoint() failed: %w", err)
 	}
 
 	if pos := strings.IndexByte(nextXid, ':'); pos > -1 {
 		nextXid = nextXid[pos+1:]
 	}
 	if v, err := strconv.Atoi(nextXid); err != nil {
-		log.Fatal("bad xid in pg_control_checkpoint()).next_xid")
+		return 0, newDomainError(codeInternalError, errors.New("bad xid in pg_control_checkpoint().next_xid"))
 	} else {
 		c.result.NextXid = v
 	}
 
 	c.fixAuroraCheckpoint()
+	return 1, nil
 }
 
-func (c *collector) getControlCheckpointv11() {
+func (c *collector) getControlCheckpointv11() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1183,19 +1495,20 @@ func (c *collector) getControlCheckpointv11() {
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.CheckpointLSN,
 		&c.result.RedoLSN, &c.result.TimelineID, &nextXid, &c.result.OldestXid,
 		&c.result.OldestActiveXid, &c.result.CheckpointTime); err != nil {
-		log.Fatalf("pg_control_checkpoint() failed: %v", err)
+		return 0, fmt.Errorf("pg_control_checkpoint() failed: %w", err)
 	}
 
 	if pos := strings.IndexByte(nextXid, ':'); pos > -1 {
 		nextXid = nextXid[pos+1:]
 	}
 	if v, err := strconv.Atoi(nextXid); err != nil {
-		log.Fatal("bad xid in pg_control_checkpoint()).next_xid")
+		return 0, newDomainError(codeInternalError, errors.New("bad xid in pg_control_checkpoint().next_xid"))
 	} else {
 		c.result.NextXid = v
 	}
 
 	c.fixAuroraCheckpoint()
+	return 1, nil
 }
 
 func (c *collector) fixAuroraCheckpoint() {
@@ -1208,7 +1521,7 @@ func (c *collector) fixAuroraCheckpoint() {
 	}
 }
 
-func (c *collector) getActivityv96() {
+func (c *collector) getActivityv96() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1235,10 +1548,11 @@ func (c *collector) getActivityv96() {
 	q += " ORDER BY pid ASC"
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength)
 	if err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var b pgmetrics.Backend
 		var backendXid, backendXmin string
@@ -1246,18 +1560,20 @@ func (c *collector) getActivityv96() {
 			&b.PID, &b.ClientAddr, &b.BackendStart, &b.XactStart, &b.QueryStart,
 			&b.StateChange, &b.WaitEventType, &b.WaitEvent, &b.State,
 			&backendXid, &backendXmin, &b.Query, &b.QueryID); err != nil {
-			log.Fatalf("pg_stat_activity query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_activity query failed: %w", err))
 		}
 		b.BackendXid, _ = strconv.Atoi(backendXid)
 		b.BackendXmin, _ = strconv.Atoi(backendXmin)
 		c.result.Backends = append(c.result.Backends, b)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getActivityv94() {
+func (c *collector) getActivityv94() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1275,10 +1591,11 @@ func (c *collector) getActivityv94() {
 		  ORDER BY pid ASC`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var b pgmetrics.Backend
 		var waiting bool
@@ -1286,20 +1603,22 @@ func (c *collector) getActivityv94() {
 			&b.PID, &b.ClientAddr, &b.BackendStart, &b.XactStart, &b.QueryStart,
 			&b.StateChange, &waiting, &b.State,
 			&b.BackendXid, &b.BackendXmin, &b.Query); err != nil {
-			log.Fatalf("pg_stat_activity query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_activity query failed: %w", err))
 		}
 		if waiting {
 			b.WaitEvent = "waiting"
 			b.WaitEventType = "waiting"
 		}
 		c.result.Backends = append(c.result.Backends, b)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getActivityv93() {
+func (c *collector) getActivityv93() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1316,56 +1635,62 @@ func (c *collector) getActivityv93() {
 		  ORDER BY pid ASC`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var b pgmetrics.Backend
 		var waiting bool
 		if err := rows.Scan(&b.DBName, &b.RoleName, &b.ApplicationName,
 			&b.PID, &b.ClientAddr, &b.BackendStart, &b.XactStart, &b.QueryStart,
 			&b.StateChange, &waiting, &b.State, &b.Query); err != nil {
-			log.Fatalf("pg_stat_activity query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_activity query failed: %w", err))
 		}
 		if waiting {
 			b.WaitEvent = "waiting"
 			b.WaitEventType = "waiting"
 		}
 		c.result.Backends = append(c.result.Backends, b)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getBETypeCountsv10() {
+func (c *collector) getBETypeCountsv10() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT backend_type, count(*) FROM pg_stat_activity GROUP BY backend_type`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
 	defer rows.Close()
 
 	m := make(map[string]int)
+	n := 0
 	for rows.Next() {
 		var bt sql.NullString
 		var count int
 		if err := rows.Scan(&bt, &count); err != nil {
-			log.Fatalf("pg_stat_activity query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_activity query failed: %w", err))
 		}
 		m[bt.String] = count
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_activity query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_activity query failed: %w", err)
 	}
 
 	if len(m) > 0 {
 		c.result.BackendTypeCounts = m
 	}
+	return n, nil
 }
 
 // fillSize - get and fill in the database size also
@@ -1374,7 +1699,7 @@ func (c *collector) getBETypeCountsv10() {
 // also: if onlyListed is true but dbList is empty, assume dbList contains
 //
 //	the name of the currently connected database
-func (c *collector) getDatabases(fillSize, onlyListed bool, dbList []string) {
+func (c *collector) getDatabases(fillSize, onlyListed bool, dbList []string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1442,11 +1767,12 @@ func (c *collector) getDatabases(fillSize, onlyListed bool, dbList []string) {
 	// do the query
 	rows, err := c.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		log.Fatalf("pg_stat_database query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_database query failed: %w", err)
 	}
 	defer rows.Close()
 
 	// collect the result
+	n := 0
 	for rows.Next() {
 		var d pgmetrics.Database
 		if err := rows.Scan(&d.OID, &d.Name, &d.DatDBA, &d.DatTablespace,
@@ -1461,25 +1787,27 @@ func (c *collector) getDatabases(fillSize, onlyListed bool, dbList []string) {
 			&d.ParallelWorkersLaunched, &d.ConflTablespace, &d.ConflLock,
 			&d.ConflSnapshot, &d.ConflBufferpin, &d.ConflDeadlock,
 			&d.ConflLogicalslot); err != nil {
-			log.Fatalf("pg_stat_database query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_database query failed: %w", err))
 		}
 		d.Size = -1 // will be filled in later if asked for
 		c.result.Databases = append(c.result.Databases, d)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_database query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_database query failed: %w", err)
 	}
 
 	// fill in the size if asked for
 	if !fillSize {
-		return
+		return n, nil
 	}
 	for i := range c.result.Databases {
 		c.fillDatabaseSize(&c.result.Databases[i])
 	}
+	return n, nil
 }
 
-func (c *collector) getTablespaces(fillSize bool) {
+func (c *collector) getTablespaces(fillSize bool) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1489,62 +1817,67 @@ func (c *collector) getTablespaces(fillSize bool) {
 		  ORDER BY oid ASC`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_tablespace query failed: %v", err)
+		return 0, fmt.Errorf("pg_tablespace query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var t pgmetrics.Tablespace
 		if err := rows.Scan(&t.OID, &t.Name, &t.Owner, &t.Location); err != nil {
-			log.Fatalf("pg_tablespace query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_tablespace query failed: %w", err))
 		}
 		t.Size = -1 // will be filled in later if asked for
 		if (t.Name == "pg_default" || t.Name == "pg_global") && t.Location == "" {
 			t.Location = c.dataDir
 		}
 		c.result.Tablespaces = append(c.result.Tablespaces, t)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_tablespace query failed: %v", err)
+		return n, fmt.Errorf("pg_tablespace query failed: %w", err)
 	}
 
 	if !fillSize {
-		return
+		return n, nil
 	}
 	for i := range c.result.Tablespaces {
 		c.fillTablespaceSize(&c.result.Tablespaces[i])
 	}
+	return n, nil
 }
 
-func (c *collector) getCurrentDatabase() (dbname string) {
+func (c *collector) getCurrentDatabase() (dbname string, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT current_database()`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&dbname); err != nil {
-		log.Fatalf("current_database failed: %v", err)
+		return "", fmt.Errorf("current_database failed: %w", err)
 	}
-	return
+	return dbname, nil
 }
 
-func (c *collector) getTables(fillSize bool) {
-	err := c.getTablesNoRetry(fillSize)
+func (c *collector) getTables(fillSize bool) (int, error) {
+	n, err := c.getTablesNoRetry(fillSize)
 	if err == nil {
-		return
+		return n, nil
 	}
 
 	if isLockTimeoutError(err) && fillSize {
 		// retry without call to pg_table_size
-		log.Print("warning: lock timeout during pg_table_size, skipping table size collection")
-		err = c.getTablesNoRetry(false)
+		if n2, err2 := c.getTablesNoRetry(false); err2 == nil {
+			c.note(domainTables, c.curTarget, "lock timeout during pg_table_size; table sizes skipped")
+			return n2, nil
+		} else {
+			return 0, err2
+		}
 	}
 
-	if err != nil {
-		log.Fatalf("pg_stat(io)_user_tables query failed: %v", err)
-	}
+	return n, err
 }
 
-func (c *collector) getTablesNoRetry(fillSize bool) error {
+func (c *collector) getTablesNoRetry(fillSize bool) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1606,10 +1939,11 @@ func (c *collector) getTablesNoRetry(fillSize bool) error {
 	}
 	rows, err := c.db.QueryContext(ctx, q, fillSize)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("pg_stat(io)_user_tables query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var t pgmetrics.Table
 		var tblspcOID int
@@ -1627,7 +1961,7 @@ func (c *collector) getTablesNoRetry(fillSize bool) error {
 			&t.Size, &t.TotalVacuumTime, &t.TotalAutovacuumTime,
 			&t.TotalAnalyzeTime, &t.TotalAutoanalyzeTime,
 			&t.StatsReset); err != nil {
-			return err
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_user_tables scan failed: %w", err))
 		}
 		t.Bloat = -1 // will be filled in later
 		if tblspcOID != 0 {
@@ -1640,37 +1974,46 @@ func (c *collector) getTablesNoRetry(fillSize bool) error {
 		}
 		if c.tableOK(t.SchemaName, t.Name) {
 			c.result.Tables = append(c.result.Tables, t)
+			n++
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return n, fmt.Errorf("pg_stat(io)_user_tables query failed: %w", err)
+	}
+	return n, nil
 }
 
 func isLockTimeoutError(err error) bool {
-	if pgerr, ok := err.(*pgconn.PgError); ok {
+	// errors may be wrapped by the domain error helpers, so unwrap
+	// the chain instead of a direct type assertion
+	var pgerr *pgconn.PgError
+	if errors.As(err, &pgerr) {
 		// see https://www.postgresql.org/docs/current/errcodes-appendix.html
 		return pgerr.Code == "55P03"
 	}
 	return false
 }
 
-func (c *collector) getIndexes(fillSize bool) {
-	err := c.getIndexesNoRetry(fillSize)
+func (c *collector) getIndexes(fillSize bool) (int, error) {
+	n, err := c.getIndexesNoRetry(fillSize)
 	if err == nil {
-		return
+		return n, nil
 	}
 
 	if isLockTimeoutError(err) && fillSize {
 		// retry without call to pg_total_relation_size
-		log.Print("warning: lock timeout during pg_total_relation_size, skipping index size collection")
-		err = c.getIndexesNoRetry(false)
+		if n2, err2 := c.getIndexesNoRetry(false); err2 == nil {
+			c.note(domainIndexes, c.curTarget, "lock timeout during pg_total_relation_size; index sizes skipped")
+			return n2, nil
+		} else {
+			return 0, err2
+		}
 	}
 
-	if err != nil {
-		log.Fatalf("pg_stat_user_indexes query failed: %v", err)
-	}
+	return n, err
 }
 
-func (c *collector) getIndexesNoRetry(fillSize bool) error {
+func (c *collector) getIndexesNoRetry(fillSize bool) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1699,10 +2042,11 @@ func (c *collector) getIndexesNoRetry(fillSize bool) error {
 	}
 	rows, err := c.db.QueryContext(ctx, q, fillSize)
 	if err != nil {
-		return err
+		return 0, fmt.Errorf("pg_stat_user_indexes query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var idx pgmetrics.Index
 		var tblspcOID int
@@ -1711,7 +2055,7 @@ func (c *collector) getIndexesNoRetry(fillSize bool) error {
 			&idx.IdxTupRead, &idx.IdxTupFetch, &idx.IdxBlksRead,
 			&idx.IdxBlksHit, &idx.RelNAtts, &idx.AMName, &tblspcOID,
 			&idx.LastIdxScan, &idx.Size, &idx.StatsReset); err != nil {
-			return err
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_user_indexes scan failed: %w", err))
 		}
 		idx.Bloat = -1 // will be filled in later
 		if tblspcOID != 0 {
@@ -1724,9 +2068,13 @@ func (c *collector) getIndexesNoRetry(fillSize bool) error {
 		}
 		if c.tableOK(idx.SchemaName, idx.TableName) {
 			c.result.Indexes = append(c.result.Indexes, idx)
+			n++
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return n, fmt.Errorf("pg_stat_user_indexes query failed: %w", err)
+	}
+	return n, nil
 }
 
 // getIndexDef gets the definition of all indexes. Used to be collected along
@@ -1734,22 +2082,23 @@ func (c *collector) getIndexesNoRetry(fillSize bool) error {
 // locks on the table in question. By collecting this separately, we'll
 // silently fail the collection of just the index defs, and let the collection
 // of index stats succeed.
-func (c *collector) getIndexDef() {
+func (c *collector) getIndexDef() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT indexrelid, pg_get_indexdef(indexrelid) FROM pg_stat_user_indexes`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		return // ignore errors silently, ok to fail to get the defn
+		return 0, fmt.Errorf("pg_get_indexdef query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var oid int
 		var defn string
 		if err := rows.Scan(&oid, &defn); err != nil {
-			break // abort silently
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_get_indexdef scan failed: %w", err))
 		}
 		for i := range c.result.Indexes {
 			if c.result.Indexes[i].OID == oid {
@@ -1757,11 +2106,15 @@ func (c *collector) getIndexDef() {
 				break
 			}
 		}
+		n++
 	}
-	// ignore checking for rows.Err()
+	if err := rows.Err(); err != nil {
+		return n, fmt.Errorf("pg_get_indexdef query failed: %w", err)
+	}
+	return n, nil
 }
 
-func (c *collector) getSequences() {
+func (c *collector) getSequences() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1776,26 +2129,29 @@ func (c *collector) getSequences() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_statio_user_sequences query failed: %v", err)
+		return 0, fmt.Errorf("pg_statio_user_sequences query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Sequence
 		if err := rows.Scan(&s.OID, &s.SchemaName, &s.Name, &s.DBName,
 			&s.BlksRead, &s.BlksHit, &s.StatsReset); err != nil {
-			log.Fatalf("pg_statio_user_sequences query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_statio_user_sequences query failed: %w", err))
 		}
 		if c.schemaOK(s.SchemaName) {
 			c.result.Sequences = append(c.result.Sequences, s)
+			n++
 		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_statio_user_sequences query failed: %v", err)
+		return n, fmt.Errorf("pg_statio_user_sequences query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getUserFunctions() {
+func (c *collector) getUserFunctions() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1810,26 +2166,29 @@ func (c *collector) getUserFunctions() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_stat_user_functions query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_user_functions query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var f pgmetrics.UserFunction
 		if err := rows.Scan(&f.OID, &f.SchemaName, &f.Name, &f.DBName,
 			&f.Calls, &f.TotalTime, &f.SelfTime, &f.StatsReset); err != nil {
-			log.Fatalf("pg_stat_user_functions query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_user_functions query failed: %w", err))
 		}
 		if c.schemaOK(f.SchemaName) {
 			c.result.UserFunctions = append(c.result.UserFunctions, f)
+			n++
 		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_user_functions query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_user_functions query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getVacuumProgressv17() {
+func (c *collector) getVacuumProgressv17() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1849,29 +2208,32 @@ func (c *collector) getVacuumProgressv17() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_stat_progress_vacuum query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_progress_vacuum query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var p pgmetrics.VacuumProgressBackend
 		if err := rows.Scan(&p.PID, &p.DBName, &p.TableOID, &p.Phase, &p.HeapBlksTotal,
 			&p.HeapBlksScanned, &p.HeapBlksVacuumed, &p.IndexVacuumCount,
 			&p.MaxDeadTupleBytes, &p.DeadTupleBytes, &p.NumDeadItemIDs,
 			&p.IndexesTotal, &p.IndexesProcessed, &p.DelayTime); err != nil {
-			log.Fatalf("pg_stat_progress_vacuum query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_vacuum query failed: %w", err))
 		}
 		if t := c.result.TableByOID(p.TableOID); t != nil {
 			p.TableName = t.Name
 		}
 		c.result.VacuumProgress = append(c.result.VacuumProgress, p)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_vacuum query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_vacuum query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getVacuumProgressv96() {
+func (c *collector) getVacuumProgressv96() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1883,28 +2245,31 @@ func (c *collector) getVacuumProgressv96() {
 		  ORDER BY pid ASC`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_stat_progress_vacuum query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_progress_vacuum query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var p pgmetrics.VacuumProgressBackend
 		if err := rows.Scan(&p.PID, &p.DBName, &p.TableOID, &p.Phase, &p.HeapBlksTotal,
 			&p.HeapBlksScanned, &p.HeapBlksVacuumed, &p.IndexVacuumCount,
 			&p.MaxDeadTuples, &p.NumDeadTuples); err != nil {
-			log.Fatalf("pg_stat_progress_vacuum query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_vacuum query failed: %w", err))
 		}
 		if t := c.result.TableByOID(p.TableOID); t != nil {
 			p.TableName = t.Name
 		}
 		c.result.VacuumProgress = append(c.result.VacuumProgress, p)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_vacuum query failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_vacuum query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getExtensions() {
+func (c *collector) getExtensions() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1919,24 +2284,27 @@ func (c *collector) getExtensions() {
 		  ORDER BY name ASC`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_available_extensions query failed: %v", err)
+		return 0, fmt.Errorf("pg_available_extensions query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var e pgmetrics.Extension
 		if err := rows.Scan(&e.Name, &e.DBName, &e.DefaultVersion,
 			&e.InstalledVersion, &e.Comment, &e.SchemaName); err != nil {
-			log.Fatalf("pg_available_extensions query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_available_extensions query failed: %w", err))
 		}
 		c.result.Extensions = append(c.result.Extensions, e)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_available_extensions query failed: %v", err)
+		return n, fmt.Errorf("pg_available_extensions query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getRoles() {
+func (c *collector) getRoles() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -1953,11 +2321,12 @@ func (c *collector) getRoles() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_roles/pg_auth_members query failed: %v", err)
+		return 0, fmt.Errorf("pg_roles/pg_auth_members query failed: %w", err)
 	}
 	defer rows.Close()
 
 	m := pgtype.NewMap()
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.Role
 		var validUntil float64
@@ -1965,19 +2334,21 @@ func (c *collector) getRoles() {
 			&r.Rolcreaterole, &r.Rolcreatedb, &r.Rolcanlogin, &r.Rolreplication,
 			&r.Rolbypassrls, &r.Rolconnlimit, &validUntil,
 			m.SQLScanner(&r.MemberOf)); err != nil {
-			log.Fatalf("pg_roles/pg_auth_members query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_roles/pg_auth_members query failed: %w", err))
 		}
 		if !math.IsInf(validUntil, 0) {
 			r.Rolvaliduntil = int64(validUntil)
 		}
 		c.result.Roles = append(c.result.Roles, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_roles/pg_auth_members query failed: %v", err)
+		return n, fmt.Errorf("pg_roles/pg_auth_members query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getReplicationSlotsv94() {
+func (c *collector) getReplicationSlotsv94() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2010,11 +2381,11 @@ func (c *collector) getReplicationSlotsv94() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_replication_slots query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_replication_slots query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var rs pgmetrics.ReplicationSlot
 		var xmin, cXmin sql.NullInt64
@@ -2023,20 +2394,22 @@ func (c *collector) getReplicationSlotsv94() {
 			&rs.DBName, &rs.Active, &xmin, &cXmin, &rlsn, &cflsn,
 			&rs.Temporary, &rs.WALStatus, &rs.SafeWALSize, &rs.TwoPhase,
 			&rs.Conflicting); err != nil {
-			log.Fatalf("pg_replication_slots query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_replication_slots query failed: %w", err))
 		}
 		rs.Xmin = int(xmin.Int64)
 		rs.CatalogXmin = int(cXmin.Int64)
 		rs.RestartLSN = rlsn.String
 		rs.ConfirmedFlushLSN = cflsn.String
 		c.result.ReplicationSlots = append(c.result.ReplicationSlots, rs)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_replication_slots query failed: %v", err)
+		return n, fmt.Errorf("pg_replication_slots query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getDisabledTriggers() {
+func (c *collector) getDisabledTriggers() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2046,15 +2419,16 @@ func (c *collector) getDisabledTriggers() {
 		  ORDER BY T.oid ASC`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_trigger/pg_proc query failed: %v", err)
+		return 0, fmt.Errorf("pg_trigger/pg_proc query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var tg pgmetrics.Trigger
 		var tgrelid int
 		if err := rows.Scan(&tg.OID, &tgrelid, &tg.Name, &tg.ProcName); err != nil {
-			log.Fatalf("pg_trigger/pg_proc query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_trigger/pg_proc query failed: %w", err))
 		}
 		if t := c.result.TableByOID(tgrelid); t != nil {
 			tg.DBName = t.DBName
@@ -2063,18 +2437,22 @@ func (c *collector) getDisabledTriggers() {
 		}
 		if c.schemaOK(tg.SchemaName) {
 			c.result.DisabledTriggers = append(c.result.DisabledTriggers, tg)
+			n++
 		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_trigger/pg_proc query failed: %v", err)
+		return n, fmt.Errorf("pg_trigger/pg_proc query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getStatements(currdb string) {
+func (c *collector) getStatements(currdb string) (int, error) {
 	// Even if PSS is installed only in one database, querying it gives queries
 	// from across all databases. Fetching this information once is enough.
 	if len(c.result.Statements) > 0 {
-		return
+		c.skip(domainStatements, c.curTarget, codeFeatureDisabled,
+			"pg_stat_statements already collected from another database")
+		return 0, nil
 	}
 
 	// Try to fetch only if PSS extension is installed.
@@ -2088,37 +2466,39 @@ func (c *collector) getStatements(currdb string) {
 		}
 	}
 	if !semver.IsValid(version) {
-		return
+		c.skip(domainStatements, c.curTarget, codeExtensionAbsent,
+			"pg_stat_statements extension is not installed in this database")
+		return 0, nil
 	}
 
 	// Collect based on pss version, not pg version. This allows for cases when
 	// postgres is upgraded, but not the extension.
 	if semver.Compare(version, "v1.13") >= 0 { // pg v19
-		c.getStatementsv113(schema)
+		return c.getStatementsv113(schema)
 	} else if semver.Compare(version, "v1.12") >= 0 { // pg v18
-		c.getStatementsv112(schema)
+		return c.getStatementsv112(schema)
 	} else if semver.Compare(version, "v1.11") >= 0 { // pg v17
-		c.getStatementsv111(schema)
+		return c.getStatementsv111(schema)
 	} else if semver.Compare(version, "v1.10") >= 0 { // pg v15, pg v16
-		c.getStatementsv110(schema)
+		return c.getStatementsv110(schema)
 	} else if semver.Compare(version, "v1.9") >= 0 { // pg v14
-		c.getStatementsv19(schema)
+		return c.getStatementsv19(schema)
 	} else if semver.Compare(version, "v1.8") >= 0 { // pg v13
-		c.getStatementsv18(schema)
+		return c.getStatementsv18(schema)
 	} else {
-		c.getStatementsPrev18(schema)
+		return c.getStatementsPrev18(schema)
 	}
 }
 
-func (c *collector) getStatementsv113(schema string) {
-	c.getStatementsv112orv113(schema, true)
+func (c *collector) getStatementsv113(schema string) (int, error) {
+	return c.getStatementsv112orv113(schema, true)
 }
 
-func (c *collector) getStatementsv112(schema string) {
-	c.getStatementsv112orv113(schema, false)
+func (c *collector) getStatementsv112(schema string) (int, error) {
+	return c.getStatementsv112orv113(schema, false)
 }
 
-func (c *collector) getStatementsv112orv113(schema string, isv113 bool) {
+func (c *collector) getStatementsv112orv113(schema string, isv113 bool) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2149,12 +2529,12 @@ func (c *collector) getStatementsv112orv113(schema string, isv113 bool) {
 	}
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength, c.stmtsLimit)
 	if err != nil {
-		log.Printf("warning: pg_stat_statements query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_statements query failed: %w", err)
 	}
 	defer rows.Close()
 
 	c.result.Statements = make([]pgmetrics.Statement, 0, c.stmtsLimit)
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Statement
 		var queryID sql.NullInt64
@@ -2175,7 +2555,7 @@ func (c *collector) getStatementsv112orv113(schema string, isv113 bool) {
 			&s.WALBuffersFull, &s.ParallelWorkersToLaunch, &s.ParallelWorkersLaunched,
 			&s.GenericPlanCalls, &s.CustomPlanCalls,
 		); err != nil {
-			log.Fatalf("pg_stat_statements scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_statements scan failed: %w", err))
 		}
 		// UserName
 		if r := c.result.RoleByOID(s.UserOID); r != nil {
@@ -2192,13 +2572,15 @@ func (c *collector) getStatementsv112orv113(schema string, isv113 bool) {
 		// MinMaxStatsSince
 		s.MinMaxStatsSince = minMaxStatsSince.Unix()
 		c.result.Statements = append(c.result.Statements, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_statements failed: %v", err)
+		return n, fmt.Errorf("pg_stat_statements failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getStatementsv111(schema string) {
+func (c *collector) getStatementsv111(schema string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2222,12 +2604,12 @@ func (c *collector) getStatementsv111(schema string) {
 	q = strings.ReplaceAll(q, "@schema@", schema)
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength, c.stmtsLimit)
 	if err != nil {
-		log.Printf("warning: pg_stat_statements query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_statements query failed: %w", err)
 	}
 	defer rows.Close()
 
 	c.result.Statements = make([]pgmetrics.Statement, 0, c.stmtsLimit)
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Statement
 		var queryID sql.NullInt64
@@ -2246,7 +2628,7 @@ func (c *collector) getStatementsv111(schema string) {
 			&s.JITEmissionTime, &s.LocalBlkReadTime, &s.LocalBlkWriteTime,
 			&s.JITDeformCount, &s.JITDeformTime, &statsSince, &minMaxStatsSince,
 		); err != nil {
-			log.Fatalf("pg_stat_statements scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_statements scan failed: %w", err))
 		}
 		// UserName
 		if r := c.result.RoleByOID(s.UserOID); r != nil {
@@ -2263,13 +2645,15 @@ func (c *collector) getStatementsv111(schema string) {
 		// MinMaxStatsSince
 		s.MinMaxStatsSince = minMaxStatsSince.Unix()
 		c.result.Statements = append(c.result.Statements, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_statements failed: %v", err)
+		return n, fmt.Errorf("pg_stat_statements failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getStatementsv110(schema string) {
+func (c *collector) getStatementsv110(schema string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2291,12 +2675,12 @@ func (c *collector) getStatementsv110(schema string) {
 	q = strings.ReplaceAll(q, "@schema@", schema)
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength, c.stmtsLimit)
 	if err != nil {
-		log.Printf("warning: pg_stat_statements query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_statements query failed: %w", err)
 	}
 	defer rows.Close()
 
 	c.result.Statements = make([]pgmetrics.Statement, 0, c.stmtsLimit)
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Statement
 		var queryID sql.NullInt64
@@ -2312,7 +2696,7 @@ func (c *collector) getStatementsv110(schema string) {
 			&s.JITGenerationTime, &s.JITInliningCount, &s.JITInliningTime,
 			&s.JITOptimizationCount, &s.JITOptimizationTime, &s.JITEmissionCount,
 			&s.JITEmissionTime); err != nil {
-			log.Fatalf("pg_stat_statements scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_statements scan failed: %w", err))
 		}
 		// UserName
 		if r := c.result.RoleByOID(s.UserOID); r != nil {
@@ -2325,13 +2709,15 @@ func (c *collector) getStatementsv110(schema string) {
 		// Query ID, set to 0 if null
 		s.QueryID = queryID.Int64
 		c.result.Statements = append(c.result.Statements, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_statements failed: %v", err)
+		return n, fmt.Errorf("pg_stat_statements failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getStatementsv19(schema string) {
+func (c *collector) getStatementsv19(schema string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2350,12 +2736,12 @@ func (c *collector) getStatementsv19(schema string) {
 	q = strings.ReplaceAll(q, "@schema@", schema)
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength, c.stmtsLimit)
 	if err != nil {
-		log.Printf("warning: pg_stat_statements query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_statements query failed: %w", err)
 	}
 	defer rows.Close()
 
 	c.result.Statements = make([]pgmetrics.Statement, 0, c.stmtsLimit)
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Statement
 		var queryID sql.NullInt64
@@ -2367,7 +2753,7 @@ func (c *collector) getStatementsv19(schema string) {
 			&s.TempBlksWritten, &s.BlkReadTime, &s.BlkWriteTime, &s.Plans,
 			&s.TotalPlanTime, &s.MinPlanTime, &s.MaxPlanTime, &s.StddevPlanTime,
 			&s.WALRecords, &s.WALFPI, &s.WALBytes, &s.TopLevel); err != nil {
-			log.Fatalf("pg_stat_statements scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_statements scan failed: %w", err))
 		}
 		// UserName
 		if r := c.result.RoleByOID(s.UserOID); r != nil {
@@ -2380,13 +2766,15 @@ func (c *collector) getStatementsv19(schema string) {
 		// Query ID, set to 0 if null
 		s.QueryID = queryID.Int64
 		c.result.Statements = append(c.result.Statements, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_statements failed: %v", err)
+		return n, fmt.Errorf("pg_stat_statements failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getStatementsv18(schema string) {
+func (c *collector) getStatementsv18(schema string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2404,12 +2792,12 @@ func (c *collector) getStatementsv18(schema string) {
 	q = strings.ReplaceAll(q, "@schema@", schema)
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength, c.stmtsLimit)
 	if err != nil {
-		log.Printf("warning: pg_stat_statements query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_statements query failed: %w", err)
 	}
 	defer rows.Close()
 
 	c.result.Statements = make([]pgmetrics.Statement, 0, c.stmtsLimit)
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Statement
 		var queryID sql.NullInt64
@@ -2421,7 +2809,7 @@ func (c *collector) getStatementsv18(schema string) {
 			&s.TempBlksWritten, &s.BlkReadTime, &s.BlkWriteTime, &s.Plans,
 			&s.TotalPlanTime, &s.MinPlanTime, &s.MaxPlanTime, &s.StddevPlanTime,
 			&s.WALRecords, &s.WALFPI, &s.WALBytes); err != nil {
-			log.Fatalf("pg_stat_statements scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_statements scan failed: %w", err))
 		}
 		// UserName
 		if r := c.result.RoleByOID(s.UserOID); r != nil {
@@ -2434,13 +2822,15 @@ func (c *collector) getStatementsv18(schema string) {
 		// Query ID, set to 0 if null
 		s.QueryID = queryID.Int64
 		c.result.Statements = append(c.result.Statements, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_statements failed: %v", err)
+		return n, fmt.Errorf("pg_stat_statements failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getStatementsPrev18(schema string) {
+func (c *collector) getStatementsPrev18(schema string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2468,16 +2858,15 @@ func (c *collector) getStatementsPrev18(schema string) {
 			q = strings.Replace(q, "stddev_time", "0", 1)
 			rows, err = c.db.QueryContext(ctx, q, c.sqlLength, c.stmtsLimit)
 		}
-		// If we still have errors, silently give up on querying
-		// pg_stat_statements.
+		// If we still have errors, give up on querying pg_stat_statements.
 		if err != nil {
-			log.Printf("warning: pg_stat_statements query failed: %v", err)
-			return
+			return 0, fmt.Errorf("pg_stat_statements query failed: %w", err)
 		}
 	}
 	defer rows.Close()
 
 	c.result.Statements = make([]pgmetrics.Statement, 0, c.stmtsLimit)
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Statement
 		var queryID sql.NullInt64
@@ -2487,7 +2876,7 @@ func (c *collector) getStatementsPrev18(schema string) {
 			&s.SharedBlksWritten, &s.LocalBlksHit, &s.LocalBlksRead,
 			&s.LocalBlksDirtied, &s.LocalBlksWritten, &s.TempBlksRead,
 			&s.TempBlksWritten, &s.BlkReadTime, &s.BlkWriteTime); err != nil {
-			log.Fatalf("pg_stat_statements scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_statements scan failed: %w", err))
 		}
 		// UserName
 		if r := c.result.RoleByOID(s.UserOID); r != nil {
@@ -2500,10 +2889,12 @@ func (c *collector) getStatementsPrev18(schema string) {
 		// Query ID, set to 0 if null
 		s.QueryID = queryID.Int64
 		c.result.Statements = append(c.result.Statements, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_statements failed: %v", err)
+		return n, fmt.Errorf("pg_stat_statements failed: %w", err)
 	}
+	return n, nil
 }
 
 func (c *collector) getWALSegmentSize() (out int) {
@@ -2536,11 +2927,11 @@ func (c *collector) isAWSAurora() bool {
 //
 //	pg_ls_waldir
 //	pg_ls_archive_statusdir
-func (c *collector) getWALCountsv12() {
+func (c *collector) getWALCountsv12() (int, error) {
 	q1 := `SELECT name FROM pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'`
 	q2 := `SELECT COUNT(*) FROM pg_ls_archive_statusdir() WHERE name ~ '^[0-9A-F]{24}.ready$'`
 
-	c.getWALCountsActual(q1, q2)
+	return c.getWALCountsActual(q1, q2)
 }
 
 // getWALCountsv11 gets the WAL file and archive ready counts using the
@@ -2548,7 +2939,7 @@ func (c *collector) getWALCountsv12() {
 //
 //	pg_ls_waldir
 //	pg_ls_dir (if not aws)
-func (c *collector) getWALCountsv11() {
+func (c *collector) getWALCountsv11() (int, error) {
 	q1 := `SELECT name FROM pg_ls_waldir() WHERE name ~ '^[0-9A-F]{24}$'`
 	q2 := `SELECT COUNT(*) FROM pg_ls_dir('pg_wal/archive_status') WHERE pg_ls_dir ~ '^[0-9A-F]{24}.ready$'`
 
@@ -2559,7 +2950,7 @@ func (c *collector) getWALCountsv11() {
 		c.result.WALReadyCount = -1
 	}
 
-	c.getWALCountsActual(q1, q2)
+	return c.getWALCountsActual(q1, q2)
 }
 
 // getWALCounts gets the WAL file and archive ready counts using the
@@ -2567,12 +2958,14 @@ func (c *collector) getWALCountsv11() {
 //
 //	pg_ls_dir (if not aws)
 //	pg_ls_dir (if not aws)
-func (c *collector) getWALCounts() {
+func (c *collector) getWALCounts() (int, error) {
 	// no one has perms for pg_ls_dir in AWS RDS, so don't try
 	if c.isAWS() {
 		c.result.WALCount = -1
 		c.result.WALReadyCount = -1
-		return
+		c.skip(domainWALCounts, "", codePlatformUnsupported,
+			"pg_ls_dir() is not available on AWS RDS")
+		return 0, nil
 	}
 
 	q1 := `SELECT pg_ls_dir FROM pg_ls_dir('pg_xlog') WHERE pg_ls_dir ~ '^[0-9A-F]{24}$'`
@@ -2582,12 +2975,12 @@ func (c *collector) getWALCounts() {
 		q2 = strings.ReplaceAll(q2, "pg_xlog", "pg_wal")
 	}
 
-	c.getWALCountsActual(q1, q2)
+	return c.getWALCountsActual(q1, q2)
 }
 
 // getWALCountsActual actually executes the given queries to get the WAL file
 // and archive ready counts.
-func (c *collector) getWALCountsActual(q1, q2 string) {
+func (c *collector) getWALCountsActual(q1, q2 string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2595,65 +2988,88 @@ func (c *collector) getWALCountsActual(q1, q2 string) {
 	walSegmentSize := uint64(c.getWALSegmentSize())
 	xLogSegmentsPerXLogID := 0x100000000 / walSegmentSize
 
-	// go through all the WAL filenames (ignore errors, need superuser)
+	// list WAL filenames; permission failures (typically pg_ls_waldir()
+	// for non-superusers) are classified as permission_denied by the
+	// executor, and the model fields stay at -1 ("unavailable").
 	c.result.WALCount = -1
 	c.result.HighestWALSegment = 0
 	count, highest := 0, uint64(0)
-	if rows, err := c.db.QueryContext(ctx, q1); err == nil {
-		for rows.Next() {
-			var name string
-			if err := rows.Scan(&name); err != nil || len(name) != 24 {
-				count = -1
-				break
-			}
-			count++ // count the number of wal files
-			logno, err1 := strconv.ParseUint(name[8:16], 16, 64)
-			segno, err2 := strconv.ParseUint(name[16:], 16, 64)
-			if err1 != nil || err2 != nil {
-				count = -1
-				break
-			}
-			logsegno := logno*xLogSegmentsPerXLogID + segno
-			if logsegno > highest { // remember the highest vluae
-				highest = logsegno
-			}
-		}
-		if err := rows.Err(); err == nil && count != -1 {
-			c.result.WALCount = count
-			c.result.HighestWALSegment = highest
-		}
-		rows.Close()
+	n := 0
+	rows, err := c.db.QueryContext(ctx, q1)
+	if err != nil {
+		return 0, fmt.Errorf("wal directory listing failed: %w", err)
 	}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return n, newDomainError(codeScanError, fmt.Errorf("wal directory listing scan failed: %w", err))
+		}
+		if len(name) != 24 {
+			rows.Close()
+			return n, newDomainError(codeScanError, fmt.Errorf("unexpected WAL filename %q", name))
+		}
+		count++ // count the number of wal files
+		n++
+		logno, err1 := strconv.ParseUint(name[8:16], 16, 64)
+		segno, err2 := strconv.ParseUint(name[16:], 16, 64)
+		if err1 != nil || err2 != nil {
+			rows.Close()
+			return n, newDomainError(codeScanError, fmt.Errorf("unparseable WAL filename %q", name))
+		}
+		logsegno := logno*xLogSegmentsPerXLogID + segno
+		if logsegno > highest { // remember the highest vluae
+			highest = logsegno
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return n, fmt.Errorf("wal directory listing failed: %w", err)
+	}
+	rows.Close()
+	c.result.WALCount = count
+	c.result.HighestWALSegment = highest
 
 	// count the number of WAL files that are ready for archiving, if we have
 	// been given a query
 	c.result.WALReadyCount = -1
 	if q2 != "" {
-		_ = c.db.QueryRowContext(ctx, q2).Scan(&c.result.WALReadyCount)
-		// ignore errors, needs superuser
+		if err := c.db.QueryRowContext(ctx, q2).Scan(&c.result.WALReadyCount); err != nil {
+			return n, fmt.Errorf("ready-to-archive WAL count failed: %w", err)
+		}
 	}
+	return n, nil
 }
 
-func (c *collector) getNotification() {
+func (c *collector) getNotification() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT pg_notification_queue_usage()`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.NotificationQueueUsage); err != nil {
-		log.Fatalf("pg_notification_queue_usage failed: %v", err)
+		return 0, fmt.Errorf("pg_notification_queue_usage failed: %w", err)
 	}
+	return 1, nil
 }
 
-func (c *collector) getLocks() {
-	c.getLockRows()
+func (c *collector) getLocks() (int, error) {
+	n, err := c.getLockRows()
+	if err != nil {
+		return 0, err
+	}
 	if c.version >= pgv96 {
-		c.getBlockers96()
+		if _, err := c.getBlockers96(); err != nil {
+			return 0, err
+		}
 	} else {
-		c.getBlockers()
+		if _, err := c.getBlockers(); err != nil {
+			return 0, err
+		}
 	}
+	return n, nil
 }
 
-func (c *collector) getLockRows() {
+func (c *collector) getLockRows() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2668,24 +3084,27 @@ SELECT COALESCE(D.datname, ''), L.locktype, L.mode, L.granted,
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_locks query failed: %v", err)
+		return 0, fmt.Errorf("pg_locks query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var l pgmetrics.Lock
 		if err := rows.Scan(&l.DBName, &l.LockType, &l.Mode, &l.Granted,
 			&l.PID, &l.RelationOID, &l.WaitStart); err != nil {
-			log.Fatalf("pg_locks query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_locks query failed: %w", err))
 		}
 		c.result.Locks = append(c.result.Locks, l)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_locks query failed: %v", err)
+		return n, fmt.Errorf("pg_locks query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getBlockers96() {
+func (c *collector) getBlockers96() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2694,26 +3113,29 @@ WITH P AS (SELECT DISTINCT pid FROM pg_locks WHERE NOT granted)
 SELECT pid, pg_blocking_pids(pid) FROM P`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_locks query failed: %v", err)
+		return 0, fmt.Errorf("pg_locks query failed: %w", err)
 	}
 	defer rows.Close()
 
 	m := pgtype.NewMap()
 	c.result.BlockingPIDs = make(map[int][]int)
+	n := 0
 	for rows.Next() {
 		var pid int
 		var blockers []int
 		if err := rows.Scan(&pid, m.SQLScanner(&blockers)); err != nil {
-			log.Fatalf("pg_locks query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_locks query failed: %w", err))
 		}
 		c.result.BlockingPIDs[pid] = blockers
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_locks query failed: %v", err)
+		return n, fmt.Errorf("pg_locks query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getBlockers() {
+func (c *collector) getBlockers() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2736,24 +3158,27 @@ SELECT DISTINCT blocked_locks.pid AS blocked_pid, blocking_locks.pid AS blocking
  WHERE NOT blocked_locks.GRANTED`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_locks query failed: %v", err)
+		return 0, fmt.Errorf("pg_locks query failed: %w", err)
 	}
 	defer rows.Close()
 
 	c.result.BlockingPIDs = make(map[int][]int)
+	n := 0
 	for rows.Next() {
 		var pid, blocker int
 		if err := rows.Scan(&pid, &blocker); err != nil {
-			log.Fatalf("pg_locks query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_locks query failed: %w", err))
 		}
 		c.result.BlockingPIDs[pid] = append(c.result.BlockingPIDs[pid], blocker)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_locks query failed: %v", err)
+		return n, fmt.Errorf("pg_locks query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getPublications() {
+func (c *collector) getPublications() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2778,26 +3203,28 @@ func (c *collector) getPublications() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_publication query failed: %v", err)
-		return // don't fail on errors
+		return 0, fmt.Errorf("pg_publication query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var p pgmetrics.Publication
 		if err := rows.Scan(&p.OID, &p.Name, &p.DBName, &p.AllTables, &p.Insert,
 			&p.Update, &p.Delete, &p.TableCount,
 			&p.AllSequences, &p.SeqCount); err != nil {
-			log.Fatalf("pg_publication query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_publication query failed: %w", err))
 		}
 		c.result.Publications = append(c.result.Publications, p)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_publication query failed: %v", err)
+		return n, fmt.Errorf("pg_publication query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getSubscriptions() {
+func (c *collector) getSubscriptions() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2927,11 +3354,11 @@ func (c *collector) getSubscriptions() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_subscription query failed: %v", err)
-		return // don't fail on errors
+		return 0, fmt.Errorf("pg_subscription query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.Subscription
 		var msgSend, msgRecv sql.NullTime
@@ -2942,7 +3369,7 @@ func (c *collector) getSubscriptions() {
 			&s.ConflInsertExists, &s.ConflUpdateOriginDiffers, &s.ConflUpdateExists,
 			&s.ConflUpdateMissing, &s.ConflDeleteOriginDiffers, &s.ConflDeleteMissing,
 			&s.ConflMultipleUniqueConflict, &s.ConflUpdateDeleted); err != nil {
-			log.Fatalf("pg_subscription query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_subscription query failed: %w", err))
 		}
 		if msgSend.Valid {
 			s.LastMsgSendTime = msgSend.Time.Unix()
@@ -2954,13 +3381,15 @@ func (c *collector) getSubscriptions() {
 			s.Latency = int64(msgRecv.Time.Sub(msgSend.Time)) / 1000
 		}
 		c.result.Subscriptions = append(c.result.Subscriptions, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_subscription query failed: %v", err)
+		return n, fmt.Errorf("pg_subscription query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getPartitionInfo() {
+func (c *collector) getPartitionInfo() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -2969,27 +3398,30 @@ func (c *collector) getPartitionInfo() {
 			WHERE c.relispartition`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_class query failed: %v", err)
+		return 0, fmt.Errorf("pg_class query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var oid int
 		var parent, pcv string
 		if err := rows.Scan(&oid, &parent, &pcv); err != nil {
-			log.Fatalf("pg_class query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_class query failed: %w", err))
 		}
 		if t := c.result.TableByOID(oid); t != nil {
 			t.ParentName = parent
 			t.PartitionCV = pcv
 		}
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_class query failed: %v", err)
+		return n, fmt.Errorf("pg_class query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getParentInfo() {
+func (c *collector) getParentInfo() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3000,35 +3432,39 @@ func (c *collector) getParentInfo() {
 	}
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Fatalf("pg_class/pg_inherits query failed: %v", err)
+		return 0, fmt.Errorf("pg_class/pg_inherits query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var oid int
 		var parent string
 		if err := rows.Scan(&oid, &parent); err != nil {
-			log.Fatalf("pg_class/pg_inherits query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_class/pg_inherits query failed: %w", err))
 		}
 		if t := c.result.TableByOID(oid); t != nil {
 			t.ParentName = parent
 		}
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_class/pg_inherits query failed: %v", err)
+		return n, fmt.Errorf("pg_class/pg_inherits query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getBloat() {
+func (c *collector) getBloat() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	rows, err := c.db.QueryContext(ctx, sqlBloat)
 	if err != nil {
-		log.Fatalf("bloat query failed: %v", err)
+		return 0, fmt.Errorf("bloat query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var dbname, schemaname, tablename, indexname string
 		var dummy [13]string // we don't want to edit sqlBloat!
@@ -3037,7 +3473,7 @@ func (c *collector) getBloat() {
 			&dummy[1], &dummy[2], &dummy[3], &dummy[4], &wastedbytes, &dummy[5],
 			&indexname, &dummy[6], &dummy[7], &dummy[8], &dummy[9], &dummy[10],
 			&wastedibytes, &dummy[11], &dummy[12]); err != nil {
-			log.Fatalf("bloat query failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("bloat query failed: %w", err))
 		}
 		if t := c.result.TableByName(dbname, schemaname, tablename); t != nil && t.Bloat == -1 {
 			t.Bloat = wastedbytes
@@ -3047,17 +3483,21 @@ func (c *collector) getBloat() {
 				i.Bloat = wastedibytes
 			}
 		}
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("bloat query failed: %v", err)
+		return n, fmt.Errorf("bloat query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getWAL() {
+func (c *collector) getWAL() (int, error) {
 	// skip if Aurora, because the function errors out with:
 	// "Function pg_stat_get_wal() is currently not supported for Aurora"
 	if c.isAWSAurora() {
-		return
+		c.skip(domainWAL, "", codeAuroraUnsupported,
+			"pg_stat_get_wal() is not supported on Aurora")
+		return 0, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
@@ -3075,16 +3515,19 @@ func (c *collector) getWAL() {
 		&w.BuffersFull, &w.Write, &w.Sync, &w.WriteTime, &w.SyncTime,
 		&w.StatsReset)
 	if err != nil {
-		log.Fatalf("pg_stat_wal query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_wal query failed: %w", err)
 	}
 	c.result.WAL = &w
+	return 1, nil
 }
 
-func (c *collector) getWALv18() {
+func (c *collector) getWALv18() (int, error) {
 	// skip if Aurora, because the function errors out with:
 	// "Function pg_stat_get_wal() is currently not supported for Aurora"
 	if c.isAWSAurora() {
-		return
+		c.skip(domainWAL, "", codeAuroraUnsupported,
+			"pg_stat_get_wal() is not supported on Aurora")
+		return 0, nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
@@ -3108,12 +3551,13 @@ func (c *collector) getWALv18() {
 	err := c.db.QueryRowContext(ctx, q).Scan(&w.Records, &w.FPI, &w.Bytes,
 		&w.BuffersFull, &w.FPIBytes, &w.StatsReset)
 	if err != nil {
-		log.Fatalf("pg_stat_wal query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_wal query failed: %w", err)
 	}
 	c.result.WAL = &w
+	return 1, nil
 }
 
-func (c *collector) getProgressAnalyze() {
+func (c *collector) getProgressAnalyze() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3136,30 +3580,32 @@ func (c *collector) getProgressAnalyze() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_progress_analyze query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_progress_analyze query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.AnalyzeProgressBackend
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.AnalyzeProgressBackend
 		if err := rows.Scan(&r.PID, &r.DBName, &r.TableOID, &r.Phase,
 			&r.SampleBlocksTotal, &r.SampleBlocksScanned, &r.ExtStatsTotal,
 			&r.ExtStatsComputed, &r.ChildTablesTotal, &r.ChildTablesDone,
 			&r.CurrentChildTableRelOID, &r.DelayTime); err != nil {
-			log.Fatalf("pg_stat_progress_analyze query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_analyze query scan failed: %w", err))
 		}
 		out = append(out, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_analyze query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_analyze query rows failed: %w", err)
 	}
 
 	c.result.AnalyzeProgress = out
+	return n, nil
 }
 
-func (c *collector) getProgressBasebackup() {
+func (c *collector) getProgressBasebackup() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3173,28 +3619,30 @@ func (c *collector) getProgressBasebackup() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_progress_basebackup query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_progress_basebackup query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.BasebackupProgressBackend
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.BasebackupProgressBackend
 		if err := rows.Scan(&r.PID, &r.Phase, &r.BackupTotal, &r.BackupStreamed,
 			&r.TablespacesTotal, &r.TablespacesStreamed); err != nil {
-			log.Fatalf("pg_stat_progress_basebackup query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_basebackup query scan failed: %w", err))
 		}
 		out = append(out, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_basebackup query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_basebackup query rows failed: %w", err)
 	}
 
 	c.result.BasebackupProgress = out
+	return n, nil
 }
 
-func (c *collector) getProgressCluster() {
+func (c *collector) getProgressCluster() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3211,29 +3659,31 @@ func (c *collector) getProgressCluster() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_progress_cluster query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_progress_cluster query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.ClusterProgressBackend
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.ClusterProgressBackend
 		if err := rows.Scan(&r.PID, &r.DBName, &r.TableOID, &r.Command, &r.Phase,
 			&r.ClusterIndexOID, &r.HeapTuplesScanned, &r.HeapTuplesWritten,
 			&r.HeapBlksTotal, &r.HeapBlksScanned, &r.IndexRebuildCount); err != nil {
-			log.Fatalf("pg_stat_progress_cluster query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_cluster query scan failed: %w", err))
 		}
 		out = append(out, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_cluster query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_cluster query rows failed: %w", err)
 	}
 
 	c.result.ClusterProgress = out
+	return n, nil
 }
 
-func (c *collector) getProgressCopy() {
+func (c *collector) getProgressCopy() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3248,29 +3698,31 @@ func (c *collector) getProgressCopy() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_progress_copy query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_progress_copy query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.CopyProgressBackend
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.CopyProgressBackend
 		if err := rows.Scan(&r.PID, &r.DBName, &r.TableOID, &r.Command, &r.Type,
 			&r.BytesProcessed, &r.BytesTotal, &r.TuplesProcessed,
 			&r.TuplesExcluded); err != nil {
-			log.Fatalf("pg_stat_progress_copy query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_copy query scan failed: %w", err))
 		}
 		out = append(out, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_copy query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_copy query rows failed: %w", err)
 	}
 
 	c.result.CopyProgress = out
+	return n, nil
 }
 
-func (c *collector) getProgressCreateIndex() {
+func (c *collector) getProgressCreateIndex() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3289,12 +3741,12 @@ func (c *collector) getProgressCreateIndex() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_progress_create_index query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_progress_create_index query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.CreateIndexProgressBackend
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.CreateIndexProgressBackend
 		if err := rows.Scan(&r.PID, &r.DBName, &r.TableOID, &r.IndexOID,
@@ -3302,18 +3754,20 @@ func (c *collector) getProgressCreateIndex() {
 			&r.CurrentLockerPID, &r.BlocksTotal, &r.BlocksDone,
 			&r.TuplesTotal, &r.TuplesDone, &r.PartitionsTotal,
 			&r.PartitionsDone); err != nil {
-			log.Fatalf("pg_stat_progress_create_index query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_create_index query scan failed: %w", err))
 		}
 		out = append(out, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_create_index query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_create_index query rows failed: %w", err)
 	}
 
 	c.result.CreateIndexProgress = out
+	return n, nil
 }
 
-func (c *collector) getProgressRepack() {
+func (c *collector) getProgressRepack() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3332,30 +3786,32 @@ func (c *collector) getProgressRepack() {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_progress_repack query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_progress_repack query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.RepackProgressBackend
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.RepackProgressBackend
 		if err := rows.Scan(&r.PID, &r.DBName, &r.TableOID, &r.Command, &r.Phase,
 			&r.RepackIndexOID, &r.HeapTuplesScanned, &r.HeapTuplesInserted,
 			&r.HeapTuplesUpdated, &r.HeapTuplesDeleted,
 			&r.HeapBlksTotal, &r.HeapBlksScanned, &r.IndexRebuildCount); err != nil {
-			log.Fatalf("pg_stat_progress_repack query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_progress_repack query scan failed: %w", err))
 		}
 		out = append(out, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_progress_repack query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_progress_repack query rows failed: %w", err)
 	}
 
 	c.result.RepackProgress = out
+	return n, nil
 }
 
-func (c *collector) getCheckpointer() {
+func (c *collector) getCheckpointer() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3375,13 +3831,14 @@ func (c *collector) getCheckpointer() {
 		&ckp.WriteTime, &ckp.SyncTime, &ckp.BuffersWritten, &ckp.StatsReset,
 		&ckp.NumDone, &ckp.SLRUWritten)
 	if err != nil {
-		log.Fatalf("pg_stat_checkpointer query failed: %v", err)
+		return 0, fmt.Errorf("pg_stat_checkpointer query failed: %w", err)
 	}
 
 	c.result.Checkpointer = &ckp
+	return 1, nil
 }
 
-func (c *collector) getStatIOs() {
+func (c *collector) getStatIOs() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3397,7 +3854,8 @@ func (c *collector) getStatIOs() {
 				COALESCE(fsync_time, 0),
 				COALESCE(EXTRACT(EPOCH FROM stats_reset)::bigint, 0)
 			FROM pg_stat_io`
-	} else if c.version >= pgv16 {
+	} else {
+		// callers gate this domain at v16; this branch serves v16/v17
 		q = `SELECT
 				backend_type, object, context,
 				COALESCE(reads, 0), COALESCE(reads*op_bytes, 0) AS read_bytes,
@@ -3411,19 +3869,16 @@ func (c *collector) getStatIOs() {
 				COALESCE(fsync_time, 0),
 				COALESCE(EXTRACT(EPOCH FROM stats_reset)::bigint, 0)
 			FROM pg_stat_io`
-	} else {
-		// pg_stat_io not present before v16
-		return
 	}
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_io query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_io query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.StatIO
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.StatIO
 		if err := rows.Scan(&r.BackendType, &r.Object, &r.Context, &r.Reads,
@@ -3431,21 +3886,23 @@ func (c *collector) getStatIOs() {
 			&r.Extends, &r.ExtendBytes, &r.ExtendTime, &r.Writebacks,
 			&r.WritebackTime, &r.Hits, &r.Evictions, &r.Reuses, &r.Fsyncs,
 			&r.FsyncTime, &r.StatsReset); err != nil {
-			log.Fatalf("pg_stat_io query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_io query scan failed: %w", err))
 		}
 		if r.Reads+r.Writes+r.Extends+r.Writebacks+r.Hits+
 			r.Evictions+r.Reuses+r.Fsyncs > 0 {
 			out = append(out, r)
 		}
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_io query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_io query rows failed: %w", err)
 	}
 
 	c.result.StatIOs = out
+	return n, nil
 }
 
-func (c *collector) getStatLocks() {
+func (c *collector) getStatLocks() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3457,28 +3914,30 @@ func (c *collector) getStatLocks() {
 			ORDER BY locktype ASC`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_stat_lock query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_stat_lock query failed: %w", err)
 	}
 	defer rows.Close()
 
 	var out []pgmetrics.StatLock
+	n := 0
 	for rows.Next() {
 		var r pgmetrics.StatLock
 		if err := rows.Scan(&r.LockType, &r.Waits, &r.WaitTime,
 			&r.FastpathExceeded, &r.StatsReset); err != nil {
-			log.Fatalf("pg_stat_lock query scan failed: %v", err)
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_stat_lock query scan failed: %w", err))
 		}
 		out = append(out, r)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("pg_stat_lock query rows failed: %v", err)
+		return n, fmt.Errorf("pg_stat_lock query rows failed: %w", err)
 	}
 
 	c.result.StatLocks = out
+	return n, nil
 }
 
-func (c *collector) getStatRecovery() {
+func (c *collector) getStatRecovery() (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -3498,14 +3957,17 @@ func (c *collector) getStatRecovery() {
 		&r.LastReplayedReadLSN, &r.LastReplayedEndLSN, &r.LastReplayedTLI,
 		&r.ReplayEndLSN, &r.ReplayEndTLI, &r.RecoveryLastXactTime,
 		&r.CurrentChunkStartTime, &r.PauseState); err != nil {
-		// note: this can fail with ErrNoRows on a >=pg19 standby when the
-		// user does not have pg_read_all_stats privilege, and a warning
-		// gets printed in that case.
-		log.Printf("warning: pg_stat_recovery query failed: %v", err)
-		return
+		// note: this can return no row on a >=pg19 standby when the user
+		// does not have pg_read_all_stats privilege; that is a genuine
+		// empty result rather than a domain failure.
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("pg_stat_recovery query failed: %w", err)
 	}
 
 	c.result.StatRecovery = &r
+	return 1, nil
 }
 
 //------------------------------------------------------------------------------
@@ -3535,13 +3997,15 @@ func (c *collector) getLogInfo() {
 	// ignore any errors.
 }
 
-func fileExists(f string) bool {
-	if fi, err := os.Stat(f); err == nil && fi != nil && fi.Mode().IsRegular() {
-		return true
-	} else if os.IsPermission(err) {
-		log.Printf("access denied trying to open log file %s", f)
+func fileExists(f string) (bool, error) {
+	fi, err := os.Stat(f)
+	if err == nil && fi != nil && fi.Mode().IsRegular() {
+		return true, nil
 	}
-	return false
+	if os.IsPermission(err) {
+		return false, err
+	}
+	return false, nil
 }
 
 func getRecentFile(d string) (f string) {
@@ -3567,10 +4031,11 @@ func getRecentFile(d string) (f string) {
 	return
 }
 
-func (c *collector) collectLogs(o CollectConfig) {
+func (c *collector) collectLogs(o CollectConfig) (int, error) {
 	// need log_file_prefix first
-	if !c.getPrefix() {
-		return // already logged
+	if ok, reason := c.getPrefix(); !ok {
+		c.skip(domainLogs, "", codeFeatureDisabled, reason)
+		return 0, nil
 	}
 
 	// try to guess the log file(s) location:
@@ -3578,9 +4043,14 @@ func (c *collector) collectLogs(o CollectConfig) {
 
 	// 1. use the user-supplied filename (--log-file)
 	if len(o.LogFile) > 0 {
-		if !fileExists(o.LogFile) {
-			log.Printf("warning: failed to locate/read specified log file %s", o.LogFile)
-			return
+		exists, err := fileExists(o.LogFile)
+		if err != nil {
+			return 0, newDomainError(codeIOError,
+				fmt.Errorf("access denied trying to open log file %s: %w", o.LogFile, err))
+		}
+		if !exists {
+			return 0, newDomainError(codeIOError,
+				fmt.Errorf("failed to locate/read specified log file %s", o.LogFile))
 		}
 		logfiles = []string{o.LogFile}
 	}
@@ -3589,8 +4059,8 @@ func (c *collector) collectLogs(o CollectConfig) {
 	if len(logfiles) == 0 && len(o.LogDir) > 0 {
 		files, err := os.ReadDir(o.LogDir)
 		if err != nil {
-			log.Printf("warning: failed to read specified log dir: %v", err)
-			return
+			return 0, newDomainError(codeIOError,
+				fmt.Errorf("failed to read specified log dir: %w", err))
 		}
 		for _, f := range files {
 			if n := f.Name(); !f.IsDir() && !strings.HasSuffix(n, ".gz") && !strings.HasSuffix(n, ".bz2") {
@@ -3602,12 +4072,15 @@ func (c *collector) collectLogs(o CollectConfig) {
 
 	// 3. if pg_current_logfile is available, try that
 	if len(logfiles) == 0 && len(c.curlogfile) > 0 {
-		if fileExists(c.curlogfile) {
+		if exists, _ := fileExists(c.curlogfile); exists {
 			// c.curlogfile can be an absolute path..
 			logfiles = []string{c.curlogfile}
-		} else if f := filepath.Join(c.dataDir, c.curlogfile); fileExists(f) {
+		} else {
 			// ..or relative to $PGDATA
-			logfiles = []string{f}
+			f := filepath.Join(c.dataDir, c.curlogfile)
+			if exists, _ := fileExists(f); exists {
+				logfiles = []string{f}
+			}
 		}
 	}
 
@@ -3618,81 +4091,106 @@ func (c *collector) collectLogs(o CollectConfig) {
 		}
 	}
 
-	// no log file found, warn the user
+	// no log file found
 	if len(logfiles) == 0 {
-		log.Print("warning: failed to guess log file location/access denied, specify explicitly with --log-file or --log-dir")
-		return
+		return 0, newDomainError(codeIOError, errors.New(
+			"failed to guess log file location or access denied, specify explicitly with --log-file or --log-dir"))
 	}
 
 	//log.Printf("debug: found log files %v, using span %d", logfiles, c.logSpan)
-	c.readLogs(logfiles)
+	return c.readLogs(logfiles)
 }
 
-func (c *collector) getPrefix() bool {
+func (c *collector) getPrefix() (bool, string) {
 	var prefix string
 	if s, ok := c.result.Settings["log_line_prefix"]; ok {
 		prefix = s.Setting
 	} else {
-		log.Print("failed to get log_line_prefix setting, cannot read log file")
-		return false
+		return false, "log_line_prefix setting is not available, cannot read log files"
 	}
 
 	rxPrefix, err := compilePrefix(prefix)
 	if err != nil {
-		log.Print(err)
-		return false
+		return false, sanitize(err.Error())
 	}
 
 	c.rxPrefix = rxPrefix
-	return true
+	return true, ""
 }
 
-func (c *collector) collectFromRDS(o CollectConfig) {
+// rdsCloudError maps AWS SDK / session errors onto the contract codes:
+// missing credentials and API authorization failures are distinguishable
+// from transport/IO problems.
+func rdsCloudError(err error) error {
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "NoCredentialProviders"),
+		strings.Contains(msg, "credentials"),
+		strings.Contains(msg, "AccessDenied"),
+		strings.Contains(msg, "UnauthorizedOperation"),
+		strings.Contains(msg, "AuthFailure"),
+		strings.Contains(msg, "InvalidClientTokenId"),
+		strings.Contains(msg, "SignatureDoesNotMatch"):
+		return newDomainError(codeAuthFailed, err)
+	default:
+		return newDomainError(codeIOError, err)
+	}
+}
+
+func (c *collector) collectFromRDS(o CollectConfig) (int, error) {
 	dbid := o.RDSDBIdentifier
-	var err error
-	defer func() {
-		if err != nil {
-			log.Printf("warning: failed to collect from AWS RDS: %v", err)
-		}
-	}()
 
 	ac, err := newAwsCollector()
 	if err != nil {
-		return
+		return 0, rdsCloudError(err)
 	}
 
 	rds := &pgmetrics.RDS{}
 	if err = ac.collect(dbid, rds); err != nil {
-		return
+		return 0, rdsCloudError(err)
 	}
 	c.result.RDS = rds
 
 	if !slices.Contains(o.Omit, "log") {
-		if !c.getPrefix() {
-			return // already logged
-		}
-		window := time.Duration(c.logSpan) * time.Minute
-		start := time.Now().Add(-window)
+		if ok, reason := c.getPrefix(); !ok {
+			// already recorded as an outcome (logs domain), here we only
+			// annotate the RDS domain to explain the missing RDS logs
+			c.note(domainRDS, "", "RDS log files were not collected: "+reason)
+		} else {
+			window := time.Duration(c.logSpan) * time.Minute
+			start := time.Now().Add(-window)
 
-		err = ac.collectLogs(dbid, start, func(lines []byte) {
-			if err := c.processLogBuf(start, lines); err != nil {
-				log.Printf("warning: %v", err)
+			// batch parse errors must not erase the collected RDS metrics;
+			// they are summarized on the success outcome instead
+			var parseFailures []string
+			err = ac.collectLogs(dbid, start, func(lines []byte) {
+				if perr := c.processLogBuf(start, lines); perr != nil {
+					parseFailures = append(parseFailures, perr.Error())
+				}
+			})
+			switch {
+			case err != nil:
+				c.note(domainRDS, "", "RDS log collection failed: "+sanitize(err.Error()))
+			case len(parseFailures) > 0:
+				c.noteOnce(domainRDS, "", "RDS log parsing errors: "+
+					sanitize(parseFailures[0]))
 			}
-		})
+		}
 	}
+	return 1, nil
 }
 
-func (c *collector) collectFromAzure(o CollectConfig) {
+func (c *collector) collectFromAzure(o CollectConfig) (int, error) {
 	timeout := time.Duration(o.TimeoutSec) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
 	var azure pgmetrics.Azure
 	if err := collectAzure(ctx, o.AzureResourceID, &azure); err != nil {
-		log.Printf("warning: failed to collect from Azure: %v", err)
-	} else {
-		c.result.Azure = &azure
+		return 0, newDomainError(codeIOError, err)
 	}
+	c.result.Azure = &azure
+	return 1, nil
 }
 
 //------------------------------------------------------------------------------

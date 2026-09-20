@@ -44,6 +44,39 @@ func model2csv(m *pgmetrics.Model, w *csv.Writer) (err error) {
 	// top-level fields
 	struct2csv("pgmetrics.", *m, w)
 
+	// collection outcome contract (the outcomes slice is not reachable
+	// through reflection, emit the rows explicitly)
+	if m.Collection != nil {
+		r := m.Collection
+		head := "pgmetrics.collection."
+		rec2csv(head+"contract_version", cleanstr(r.ContractVersion), w)
+		rec2csv(head+"policy", cleanstr(r.Policy), w)
+		rec2csv(head+"status", cleanstr(r.Status), w)
+		rec2csv(head+"started_at", strconv.FormatInt(r.StartedAt, 10), w)
+		rec2csv(head+"ended_at", strconv.FormatInt(r.EndedAt, 10), w)
+		rec2csv(head+"outcomes.count", strconv.Itoa(len(r.Outcomes)), w)
+		for i, o := range r.Outcomes {
+			oh := fmt.Sprintf("pgmetrics.collection.outcome.%d.", i)
+			rec2csv(oh+"domain", cleanstr(o.Domain), w)
+			if o.Target != "" {
+				rec2csv(oh+"target", cleanstr(o.Target), w)
+			}
+			rec2csv(oh+"status", cleanstr(o.Status), w)
+			rec2csv(oh+"started_at", strconv.FormatInt(o.StartedAt, 10), w)
+			rec2csv(oh+"ended_at", strconv.FormatInt(o.EndedAt, 10), w)
+			rec2csv(oh+"duration_millis", strconv.FormatInt(o.DurationMillis, 10), w)
+			if o.Code != "" {
+				rec2csv(oh+"code", cleanstr(o.Code), w)
+			}
+			if o.Summary != "" {
+				rec2csv(oh+"summary", cleanstr(o.Summary), w)
+			}
+			if o.Rows != 0 {
+				rec2csv(oh+"rows", strconv.Itoa(o.Rows), w)
+			}
+		}
+	}
+
 	// wal archiving
 	struct2csv("pgmetrics.wal_archiving.", m.WALArchiving, w)
 

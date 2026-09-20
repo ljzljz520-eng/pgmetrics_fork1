@@ -19,7 +19,6 @@ package collector
 import (
 	"context"
 	"fmt"
-	"log"
 	"strconv"
 	"strings"
 
@@ -27,7 +26,7 @@ import (
 	"golang.org/x/mod/semver"
 )
 
-func (c *collector) getCitus(currdb string, fillSize bool) {
+func (c *collector) getCitus(currdb string, fillSize bool) (int, error) {
 	// check if citus extension is present in current database
 	found := false
 	for _, e := range c.result.Extensions {
@@ -37,7 +36,9 @@ func (c *collector) getCitus(currdb string, fillSize bool) {
 		}
 	}
 	if !found {
-		return
+		c.skip(domainCitus, c.curTarget, codeExtensionAbsent,
+			"citus extension is not installed in database "+currdb)
+		return 0, nil
 	}
 
 	// setup result
@@ -50,59 +51,83 @@ func (c *collector) getCitus(currdb string, fillSize bool) {
 
 	// get version
 	var majorVer int
-	c.getCitusVersion(currdb, &majorVer)
+	if err := c.getCitusVersion(currdb, &majorVer); err != nil {
+		// "no Citus" only when the object/function is genuinely absent;
+		// timeouts, permission errors and the like must surface as the
+		// domain failure they are.
+		if _, code := classify(err); code == codeUndefinedObject {
+			c.skip(domainCitus, c.curTarget, codeExtensionAbsent,
+				"citus extension is not installed in database "+currdb)
+			return 0, nil
+		}
+		return 0, err
+	}
 
 	// get size (if not explicitly disabled)
 	if fillSize {
-		c.getCitusTableSizes(currdb)
+		if _, err := c.getCitusTableSizes(currdb); err != nil {
+			return 0, err
+		}
 	}
 
-	c.getCitusNodes(currdb)              // pg_dist_node
-	c.getCitusStatements(currdb)         // citus_stat_statements
-	c.getCitusActivity(currdb, majorVer) // citus_{dist_,worker_,}stat_activity
-	c.getCitusLocks(currdb, majorVer)    // citus_lock_waits
+	if _, err := c.getCitusNodes(currdb); err != nil { // pg_dist_node
+		return 0, err
+	}
+	if _, err := c.getCitusStatements(currdb); err != nil { // citus_stat_statements
+		return 0, err
+	}
+	if err := c.getCitusActivity(currdb, majorVer); err != nil { // citus_{dist_,worker_,}stat_activity
+		return 0, err
+	}
+	if _, err := c.getCitusLocks(currdb, majorVer); err != nil { // citus_lock_waits
+		return 0, err
+	}
 
 	if majorVer >= 11 {
-		c.getCitusTables(currdb)
-		c.getCitusNodeIDs(currdb)
+		if _, err := c.getCitusTables(currdb); err != nil {
+			return 0, err
+		}
+		if err := c.getCitusNodeIDs(currdb); err != nil {
+			return 0, err
+		}
 	}
+	return 1, nil
 }
 
-func (c *collector) getCitusVersion(currdb string, major *int) {
+func (c *collector) getCitusVersion(currdb string, major *int) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	var cv string
 	q := `SELECT citus_version()`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&cv); err != nil {
-		log.Printf("warning: citus_version() in db %q failed:: %v", currdb, err)
-		return
+		return fmt.Errorf("citus_version() failed: %w", err)
 	}
 	c.result.Citus[currdb].Version = cv
 
 	if s := semver.Major("v" + c.setting("citus.version")); s != "" {
 		*major, _ = strconv.Atoi(strings.TrimPrefix(s, "v"))
 	}
+	return nil
 }
 
-func (c *collector) getCitusTableSizes(currdb string) {
+func (c *collector) getCitusTableSizes(currdb string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT logicalrelid::oid, citus_table_size(logicalrelid) FROM pg_dist_partition`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_dist_partition/citus_table_size query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_dist_partition/citus_table_size query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var oid int
 		var size int64
 		if err := rows.Scan(&oid, &size); err != nil {
-			log.Printf("warning: pg_dist_partition/citus_table_size query failed: %v", err)
-			return
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_dist_partition/citus_table_size query failed: %w", err))
 		}
 		for i, t := range c.result.Tables { // update sizes
 			if t.OID == oid && t.DBName == currdb {
@@ -110,13 +135,15 @@ func (c *collector) getCitusTableSizes(currdb string) {
 				break
 			}
 		}
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("warning: pg_dist_partition/citus_table_size query failed: %v", err)
+		return n, fmt.Errorf("pg_dist_partition/citus_table_size query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getCitusNodes(currdb string) {
+func (c *collector) getCitusNodes(currdb string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -125,28 +152,29 @@ func (c *collector) getCitusNodes(currdb string) {
             FROM pg_dist_node`
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: pg_dist_node query failed: %v", err)
-		return
+		return 0, fmt.Errorf("pg_dist_node query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var node pgmetrics.CitusNode
 		if err := rows.Scan(&node.ID, &node.GroupID, &node.Name, &node.Port,
 			&node.Rack, &node.IsActive, &node.Role, &node.Cluster,
 			&node.ShouldHaveShards); err != nil {
-			log.Printf("warning: pg_dist_node query failed: %v", err)
-			return
+			return n, newDomainError(codeScanError, fmt.Errorf("pg_dist_node query failed: %w", err))
 		}
 		c.result.Citus[currdb].Nodes = append(c.result.Citus[currdb].Nodes, node)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("warning: pg_dist_node query failed: %v", err)
+		return n, fmt.Errorf("pg_dist_node query failed: %w", err)
 	}
+	return n, nil
 }
 
 // citus_stat_statements
-func (c *collector) getCitusStatements(currdb string) {
+func (c *collector) getCitusStatements(currdb string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -155,29 +183,29 @@ func (c *collector) getCitusStatements(currdb string) {
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
 		if strings.Contains(err.Error(), "Citus Enterprise") {
-			err = nil // silently ignore this "error"
-		} else {
-			log.Printf("warning: citus_stat_statements query failed: %v", err)
+			return 0, nil // silently ignore this "error"
 		}
-		return
+		return 0, fmt.Errorf("citus_stat_statements query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var s pgmetrics.CitusStatement
 		if err := rows.Scan(&s.QueryID, &s.UserOID, &s.DBOID, &s.Query,
 			&s.Executor, &s.PartitionKey, &s.Calls); err != nil {
-			log.Printf("warning: citus_stat_statements query failed: %v", err)
-			return
+			return n, newDomainError(codeScanError, fmt.Errorf("citus_stat_statements query failed: %w", err))
 		}
 		c.result.Citus[currdb].Statements = append(c.result.Citus[currdb].Statements, s)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("warning: citus_stat_statements query failed: %v", err)
+		return n, fmt.Errorf("citus_stat_statements query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getCitusBackendsv11() []pgmetrics.CitusBackendV11 {
+func (c *collector) getCitusBackendsv11() ([]pgmetrics.CitusBackendV11, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -197,8 +225,7 @@ func (c *collector) getCitusBackendsv11() []pgmetrics.CitusBackendV11 {
 		  FROM citus_stat_activity ORDER BY pid ASC`
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength)
 	if err != nil {
-		log.Printf("warning: citus_stat_activity query failed: %v", err)
-		return nil
+		return nil, fmt.Errorf("citus_stat_activity query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -210,19 +237,17 @@ func (c *collector) getCitusBackendsv11() []pgmetrics.CitusBackendV11 {
 			&b.StateChange, &b.WaitEventType, &b.WaitEvent, &b.State,
 			&b.BackendXid, &b.BackendXmin, &b.Query, &b.GlobalPID,
 			&b.NodeID, &b.IsWorkerQuery, &b.QueryID, &b.BackendType); err != nil {
-			log.Printf("warning: citus_stat_activity query failed: %v", err)
-			return nil
+			return nil, newDomainError(codeScanError, fmt.Errorf("citus_stat_activity query failed: %w", err))
 		}
 		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("warning: citus_stat_activity query failed: %v", err)
-		return nil
+		return nil, fmt.Errorf("citus_stat_activity query failed: %w", err)
 	}
-	return out
+	return out, nil
 }
 
-func (c *collector) getCitusBackends(table string) []pgmetrics.CitusBackend {
+func (c *collector) getCitusBackends(table string) ([]pgmetrics.CitusBackend, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -245,8 +270,7 @@ func (c *collector) getCitusBackends(table string) []pgmetrics.CitusBackend {
 	q = fmt.Sprintf(q, table)
 	rows, err := c.db.QueryContext(ctx, q, c.sqlLength)
 	if err != nil {
-		log.Printf("warning: %s query failed: %v", table, err)
-		return nil
+		return nil, fmt.Errorf("%s query failed: %w", table, err)
 	}
 	defer rows.Close()
 
@@ -259,29 +283,40 @@ func (c *collector) getCitusBackends(table string) []pgmetrics.CitusBackend {
 			&b.BackendXid, &b.BackendXmin, &b.Query, &b.QueryHostname,
 			&b.QueryPort, &b.MasterQueryHostname, &b.MasterQueryPort,
 			&b.TxNumber, &b.TxStamp); err != nil {
-			log.Printf("warning: %s query failed: %v", table, err)
-			return nil
+			return nil, newDomainError(codeScanError, fmt.Errorf("%s query failed: %w", table, err))
 		}
 		out = append(out, b)
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("warning: %s query failed: %v", table, err)
-		return nil
+		return nil, fmt.Errorf("%s query failed: %w", table, err)
 	}
-	return out
+	return out, nil
 }
 
-func (c *collector) getCitusActivity(currdb string, major int) {
+func (c *collector) getCitusActivity(currdb string, major int) error {
 	if major >= 11 {
-		c.result.Citus[currdb].AllBackends = c.getCitusBackendsv11()
+		b, err := c.getCitusBackendsv11()
+		if err != nil {
+			return err
+		}
+		c.result.Citus[currdb].AllBackends = b
 	} else {
-		c.result.Citus[currdb].Backends = c.getCitusBackends("citus_dist_stat_activity")
-		c.result.Citus[currdb].WorkerBackends = c.getCitusBackends("citus_worker_stat_activity")
+		b, err := c.getCitusBackends("citus_dist_stat_activity")
+		if err != nil {
+			return err
+		}
+		c.result.Citus[currdb].Backends = b
+		wb, err := c.getCitusBackends("citus_worker_stat_activity")
+		if err != nil {
+			return err
+		}
+		c.result.Citus[currdb].WorkerBackends = wb
 	}
+	return nil
 }
 
 // citus_lock_waits
-func (c *collector) getCitusLocks(currdb string, majorVer int) {
+func (c *collector) getCitusLocks(currdb string, majorVer int) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
@@ -301,25 +336,26 @@ func (c *collector) getCitusLocks(currdb string, majorVer int) {
 
 	rows, err := c.db.QueryContext(ctx, q)
 	if err != nil {
-		log.Printf("warning: citus_lock_waits query failed: %v", err)
-		return
+		return 0, fmt.Errorf("citus_lock_waits query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var l pgmetrics.CitusLock
 		if err := rows.Scan(&l.WaitingPID, &l.BlockingPID, &l.BlockedStmt,
 			&l.CurrStmt, &l.WaitingNodeID, &l.BlockingNodeID,
 			&l.WaitingNodeName, &l.BlockingNodeName, &l.WaitingNodePort,
 			&l.BlockingNodePort, &l.WaitingGPID, &l.BlockingGPID); err != nil {
-			log.Printf("warning: citus_lock_waits query failed: %v", err)
-			return
+			return n, newDomainError(codeScanError, fmt.Errorf("citus_lock_waits query failed: %w", err))
 		}
 		c.result.Citus[currdb].Locks = append(c.result.Citus[currdb].Locks, l)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("warning: citus_lock_waits query failed: %v", err)
+		return n, fmt.Errorf("citus_lock_waits query failed: %w", err)
 	}
+	return n, nil
 }
 
 // citusTablesSQL is a slightly modified version of the SQL used for citus_tables
@@ -351,39 +387,41 @@ SELECT p.logicalrelid::oid::int AS table_oid,
  ORDER BY (p.logicalrelid::text)
 `
 
-func (c *collector) getCitusTables(currdb string) {
+func (c *collector) getCitusTables(currdb string) (int, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	rows, err := c.db.QueryContext(ctx, citusTablesSQL)
 	if err != nil {
-		log.Printf("warning: citus tables query failed: %v", err)
-		return
+		return 0, fmt.Errorf("citus tables query failed: %w", err)
 	}
 	defer rows.Close()
 
+	n := 0
 	for rows.Next() {
 		var t pgmetrics.CitusTable
 		if err := rows.Scan(&t.OID, &t.TableName, &t.TableType,
 			&t.DistributionColumn, &t.ColocationID, &t.Size, &t.ShardCount,
 			&t.TableOwner, &t.AccessMethod); err != nil {
-			log.Printf("warning: citus tables query failed: %v", err)
-			return
+			return n, newDomainError(codeScanError, fmt.Errorf("citus tables query failed: %w", err))
 		}
 		c.result.Citus[currdb].Tables = append(c.result.Citus[currdb].Tables, t)
+		n++
 	}
 	if err := rows.Err(); err != nil {
-		log.Printf("warning: citus tables query failed: %v", err)
+		return n, fmt.Errorf("citus tables query failed: %w", err)
 	}
+	return n, nil
 }
 
-func (c *collector) getCitusNodeIDs(currdb string) {
+func (c *collector) getCitusNodeIDs(currdb string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
 	defer cancel()
 
 	q := `SELECT COALESCE(citus_coordinator_nodeid(), 0), COALESCE(citus_backend_gpid(), 0)/10000000000`
 	if err := c.db.QueryRowContext(ctx, q).Scan(&c.result.Citus[currdb].CoordinatorNodeID,
 		&c.result.Citus[currdb].ConnectedNodeID); err != nil {
-		log.Printf("warning: citus_coordinator_nodeid()/citus_backend_gpid() query failed: %v", err)
+		return fmt.Errorf("citus_coordinator_nodeid()/citus_backend_gpid() query failed: %w", err)
 	}
+	return nil
 }

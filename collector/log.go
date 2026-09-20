@@ -22,7 +22,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"regexp"
 	"strconv"
@@ -41,13 +40,28 @@ var (
 	rxAVElapsed = regexp.MustCompile(`, elapsed: ([0-9.]+) s`)
 )
 
-func (c *collector) readLogs(filenames []string) {
+func (c *collector) readLogs(filenames []string) (int, error) {
+	before := len(c.result.LogEntries)
+	// per-file read errors are aggregated into a single logs-domain
+	// outcome instead of producing one warning per file
+	var failures []string
 	for _, filename := range filenames {
 		//log.Printf("debug: reading %s, csv=%v", filename, c.csvlog)
 		if err := c.readLogLines(filename); err != nil {
-			log.Printf("warning: while reading log file %s: %v", filename, err)
+			failures = append(failures, fmt.Sprintf("%s: %v", filename, err))
 		}
 	}
+	rows := len(c.result.LogEntries) - before
+	if len(failures) > 0 {
+		summary := sanitize(strings.Join(failures, "; "))
+		if rows == 0 {
+			return 0, newDomainError(codeIOError, errors.New(summary))
+		}
+		c.note(domainLogs, "", fmt.Sprintf(
+			"%d of %d log file(s) could not be read: %s",
+			len(failures), len(filenames), summary))
+	}
+	return rows, nil
 }
 
 func (c *collector) readLogLines(filename string) error {
@@ -337,10 +351,10 @@ func (c *collector) processAE(sm []string) {
 		}
 	case len(sm[2]) > 0:
 		p.Format = "xml"
-		log.Print("warning: xml format auto_explain output not supported yet")
+		c.noteOnce(domainLogs, "", "warning: xml format auto_explain output not supported yet")
 	case len(sm[3]) > 0:
 		p.Format = "yaml"
-		log.Print("warning: yaml format auto_explain output not supported yet")
+		c.noteOnce(domainLogs, "", "warning: yaml format auto_explain output not supported yet")
 	case len(sm[4]) > 0:
 		p.Format = "text"
 		var sp *string = nil
